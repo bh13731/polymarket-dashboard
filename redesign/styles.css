@@ -1386,6 +1386,11 @@ em { font-style: italic; }
 }
 
 /* ─────────────────────────────────  ENTRANCE MOTION  ─────────────────────── */
+/* Rise-on-load entrance. The keyframe drives both the start AND end state
+   so when animations don't run (extension blocks, reduced-motion, weird
+   embedded-browser surfaces) the elements simply stay at their natural
+   opacity:1. We don't pre-set opacity:0 — that would trap content as
+   invisible if the animation never ticks. */
 .hero-eyebrow,
 .hero-figure,
 .hero-lede,
@@ -1400,9 +1405,7 @@ em { font-style: italic; }
 .watch-frame,
 .health-grid,
 .colophon {
-  opacity: 0;
-  transform: translateY(8px);
-  animation: rise 800ms var(--ease-out) forwards;
+  animation: rise 800ms var(--ease-out) both;
 }
 .hero-eyebrow { animation-delay: 80ms; }
 .hero-figure { animation-delay: 180ms; }
@@ -1419,7 +1422,8 @@ em { font-style: italic; }
 .health-grid { animation-delay: 280ms; }
 .colophon { animation-delay: 100ms; }
 @keyframes rise {
-  to { opacity: 1; transform: translateY(0); }
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
