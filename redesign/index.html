@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>The Speculator's Ledger — Polymarket Trading Desk</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    rel="stylesheet"
+    href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght,SOFT@0,9..144,300..700,0..100;1,9..144,300..700,0..100&family=Bricolage+Grotesque:opsz,wght@12..96,300..700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+  />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="grain" aria-hidden="true"></div>
+
+  <!-- ═══════════ MASTHEAD ═══════════ -->
+  <header class="masthead">
+    <div class="masthead-row">
+      <div class="masthead-edition">
+        <span class="masthead-volume">Vol. I</span>
+        <span class="masthead-dot" aria-hidden="true">·</span>
+        <span class="masthead-no" data-edition>No. 2026.05.06</span>
+        <span class="masthead-dot" aria-hidden="true">·</span>
+        <span class="masthead-time" data-refreshed>06:04 UTC</span>
+      </div>
+      <h1 class="masthead-title">
+        <span class="masthead-title-the">The</span>
+        <span class="masthead-title-name">Speculator&rsquo;s Ledger</span>
+      </h1>
+      <div class="masthead-meta">
+        <button
+          class="theme-toggle"
+          type="button"
+          data-theme-toggle
+          aria-label="Toggle morning / night edition"
+        >
+          <span class="theme-toggle-icon" aria-hidden="true">◐</span>
+          <span class="theme-toggle-label" data-theme-label>Morning</span>
+        </button>
+        <span class="status-pill" data-mode>
+          <span class="status-pill-dot"></span>
+          <span class="status-pill-label">Static archive</span>
+        </span>
+      </div>
+    </div>
+    <div class="masthead-strap">
+      <span>Polymarket trading desk</span>
+      <span class="strap-dash" aria-hidden="true"></span>
+      <span>An hourly mirror of an autonomous prediction-market agent</span>
+      <span class="strap-dash" aria-hidden="true"></span>
+      <span>Sim mode</span>
+    </div>
+  </header>
+
+  <!-- ═══════════ STICKY SECTION NAV (DESKTOP) ═══════════ -->
+  <nav class="folio-nav" aria-label="Sections" data-folio-nav>
+    <a href="#folio-equity" data-folio-link="folio-equity">
+      <span class="folio-nav-num">I</span>
+      <span class="folio-nav-label">Equity</span>
+    </a>
+    <a href="#folio-strategies" data-folio-link="folio-strategies">
+      <span class="folio-nav-num">II</span>
+      <span class="folio-nav-label">Strategies</span>
+    </a>
+    <a href="#folio-book" data-folio-link="folio-book">
+      <span class="folio-nav-num">III</span>
+      <span class="folio-nav-label">Open book</span>
+    </a>
+    <a href="#folio-tape" data-folio-link="folio-tape">
+      <span class="folio-nav-num">IV</span>
+      <span class="folio-nav-label">Live tape</span>
+    </a>
+    <a href="#folio-watch" data-folio-link="folio-watch">
+      <span class="folio-nav-num">V</span>
+      <span class="folio-nav-label">Watch</span>
+    </a>
+    <a href="#folio-health" data-folio-link="folio-health">
+      <span class="folio-nav-num">VI</span>
+      <span class="folio-nav-label">Health</span>
+    </a>
+  </nav>
+
+  <main class="page">
+    <!-- ═══════════ HERO / BANKROLL ═══════════ -->
+    <section class="hero" aria-labelledby="hero-bankroll">
+      <div class="hero-inner">
+        <div class="hero-eyebrow">
+          <span class="eyebrow-text">Closing bankroll</span>
+          <span class="eyebrow-rule" aria-hidden="true"></span>
+          <span class="eyebrow-meta" data-as-of>as of 06 May 06:04 UTC</span>
+        </div>
+
+        <div class="hero-figure">
+          <span class="hero-currency" aria-hidden="true">$</span>
+          <span class="hero-number" id="hero-bankroll" data-bankroll-value>5,373.47</span>
+        </div>
+
+        <p class="hero-lede" data-lede>
+          Down <em data-lede-24h>$1,458</em> since dawn and <em data-lede-reset>$2,627</em> since the
+          A/B reset on <span data-lede-reset-date>2&nbsp;May</span>. The book has been hostile —
+          <em>sharp_consensus</em> and <em>arbitrage</em> account for two-thirds of realised loss,
+          while three strategies remain in observation only. The agent passed <em data-lede-evals>4,126</em>
+          decisions through its gates in the last 24 hours; <em>97%</em> were refused before risk.
+        </p>
+
+        <dl class="hero-kpis">
+          <div class="kpi">
+            <dt>24-hour change</dt>
+            <dd class="kpi-value loss" data-kpi-24h>
+              <span class="kpi-abs">&minus;$1,457.80</span>
+              <span class="kpi-pct">−21.34%</span>
+            </dd>
+          </div>
+          <div class="kpi">
+            <dt>Since reset</dt>
+            <dd class="kpi-value loss" data-kpi-reset>
+              <span class="kpi-abs">&minus;$2,626.53</span>
+              <span class="kpi-pct">−32.83%</span>
+            </dd>
+          </div>
+          <div class="kpi">
+            <dt>Open positions</dt>
+            <dd class="kpi-value" data-kpi-open>
+              <span class="kpi-abs">21</span>
+              <span class="kpi-pct">across 6 strategies</span>
+            </dd>
+          </div>
+          <div class="kpi">
+            <dt>Strategies</dt>
+            <dd class="kpi-value" data-kpi-strats>
+              <span class="kpi-abs">10</span>
+              <span class="kpi-pct">4 active &middot; 3 holding &middot; 3 dormant</span>
+            </dd>
+          </div>
+        </dl>
+      </div>
+    </section>
+
+    <!-- ═══════════ I — EQUITY CURVE ═══════════ -->
+    <section class="folio" id="folio-equity" aria-labelledby="head-equity">
+      <header class="folio-head">
+        <div class="folio-num"><span class="numeral">I</span></div>
+        <div class="folio-titles">
+          <h2 class="folio-title" id="head-equity">The equity curve</h2>
+          <p class="folio-deck">
+            Bankroll $8,000 at the A/B reset. Three drawdown clusters since.
+          </p>
+        </div>
+        <div class="folio-controls" data-range-controls>
+          <button class="range-pill" data-range="last_24h">24 H</button>
+          <button class="range-pill" data-range="last_7d">7 D</button>
+          <button class="range-pill is-active" data-range="since_reset">Since reset</button>
+        </div>
+      </header>
+
+      <div class="equity-frame">
+        <div class="equity-rail" data-equity-stats>
+          <div class="rail-item">
+            <span class="rail-label">High</span>
+            <span class="rail-value" data-stat-high>—</span>
+          </div>
+          <div class="rail-item">
+            <span class="rail-label">Low</span>
+            <span class="rail-value" data-stat-low>—</span>
+          </div>
+          <div class="rail-item">
+            <span class="rail-label">Drawdown</span>
+            <span class="rail-value" data-stat-dd>—</span>
+          </div>
+          <div class="rail-item">
+            <span class="rail-label">Volatility (1h)</span>
+            <span class="rail-value" data-stat-vol>—</span>
+          </div>
+        </div>
+        <figure class="equity-chart-wrap">
+          <svg class="equity-chart" data-equity-chart aria-hidden="true"></svg>
+          <figcaption class="equity-caption">
+            Solid line: realised &amp; unrealised bankroll. Dotted: notional break-even at reset.
+            Crosshair on hover.
+          </figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <!-- ═══════════ II — STRATEGY LEDGER ═══════════ -->
+    <section class="folio" id="folio-strategies" aria-labelledby="head-strategies">
+      <header class="folio-head">
+        <div class="folio-num"><span class="numeral">II</span></div>
+        <div class="folio-titles">
+          <h2 class="folio-title" id="head-strategies">Strategies, by absolute impact</h2>
+          <p class="folio-deck">Realised P/L since A/B reset, ranked by influence on the bankroll.</p>
+        </div>
+        <div class="folio-controls">
+          <span class="folio-meta" data-strat-meta>—</span>
+        </div>
+      </header>
+
+      <div class="strat-impact" data-strat-impact>
+        <div class="strat-impact-label">Share of realised loss · since reset</div>
+        <div class="strat-impact-bar" data-strat-impact-bar></div>
+        <div class="strat-impact-legend" data-strat-impact-legend></div>
+      </div>
+
+      <div class="strat-grid" data-strat-grid></div>
+
+      <div class="strat-dormant" data-strat-dormant></div>
+    </section>
+
+    <!-- ═══════════ III — OPEN BOOK ═══════════ -->
+    <section class="folio" id="folio-book" aria-labelledby="head-book">
+      <header class="folio-head">
+        <div class="folio-num"><span class="numeral">III</span></div>
+        <div class="folio-titles">
+          <h2 class="folio-title" id="head-book">The open book</h2>
+          <p class="folio-deck">
+            21 positions, top 15 by capital outlay. Mark-to-market unrealised P/L &amp;
+            paired exposure where the agent is on both sides of a single market.
+          </p>
+        </div>
+        <div class="folio-controls">
+          <span class="folio-meta" data-book-net>Net unrealised &mdash;</span>
+        </div>
+      </header>
+      <div class="book-frame">
+        <table class="book-table" data-book-table>
+          <thead>
+            <tr>
+              <th class="th-market" data-sort="market">Market</th>
+              <th data-sort="side">Side</th>
+              <th data-sort="entry" class="num">Entry</th>
+              <th data-sort="mark" class="num">Mark</th>
+              <th data-sort="cost" class="num">Cost</th>
+              <th data-sort="unrealised" class="num is-active">Unrealised</th>
+              <th data-sort="hrs_left" class="num">Resolves</th>
+            </tr>
+          </thead>
+          <tbody data-book-body></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ═══════════ IV — LIVE TAPE / DECISIONS ═══════════ -->
+    <section class="folio" id="folio-tape" aria-labelledby="head-tape">
+      <header class="folio-head">
+        <div class="folio-num"><span class="numeral">IV</span></div>
+        <div class="folio-titles">
+          <h2 class="folio-title" id="head-tape">The live tape</h2>
+          <p class="folio-deck">
+            Why the agent did <em>not</em> trade — refusals aggregated by strategy and gate.
+            <span data-tape-total></span>
+          </p>
+        </div>
+        <div class="folio-controls">
+          <span class="folio-meta">24 hour window</span>
+        </div>
+      </header>
+
+      <div class="tape-frame">
+        <div class="tape-aggregates" data-tape-aggregates></div>
+        <aside class="tape-side">
+          <div class="tape-side-head">Top refusal reasons</div>
+          <ol class="tape-reasons" data-tape-reasons></ol>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ═══════════ V — MARKETS WATCH ═══════════ -->
+    <section class="folio" id="folio-watch" aria-labelledby="head-watch">
+      <header class="folio-head">
+        <div class="folio-num"><span class="numeral">V</span></div>
+        <div class="folio-titles">
+          <h2 class="folio-title" id="head-watch">Markets in observation</h2>
+          <p class="folio-deck" data-watch-deck>
+            Live mid-prices &amp; gates that have passed for each watchlist market.
+          </p>
+        </div>
+        <div class="folio-controls">
+          <input
+            class="watch-filter"
+            type="search"
+            placeholder="Filter by market or gate…"
+            data-watch-filter
+            aria-label="Filter watchlist"
+          />
+        </div>
+      </header>
+
+      <div class="watch-frame">
+        <table class="watch-table" data-watch-table>
+          <thead>
+            <tr>
+              <th class="th-market">Market</th>
+              <th class="num">Yes</th>
+              <th class="num">Spread</th>
+              <th>Gates passed</th>
+            </tr>
+          </thead>
+          <tbody data-watch-body></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ═══════════ VI — SYSTEM HEALTH ═══════════ -->
+    <section class="folio" id="folio-health" aria-labelledby="head-health">
+      <header class="folio-head">
+        <div class="folio-num"><span class="numeral">VI</span></div>
+        <div class="folio-titles">
+          <h2 class="folio-title" id="head-health">System health</h2>
+          <p class="folio-deck">
+            LLM activity, settlements ledger and weekly P/L pulse — for the engineer,
+            not the speculator.
+          </p>
+        </div>
+      </header>
+
+      <div class="health-grid">
+        <article class="health-card health-llm">
+          <div class="health-card-head">
+            <h3 class="health-card-title">LLM activity (24 h)</h3>
+            <span class="health-card-meta" data-llm-total></span>
+          </div>
+          <table class="health-table" data-llm-table>
+            <thead>
+              <tr>
+                <th>Strategy</th>
+                <th class="num">Calls</th>
+                <th class="num">Intents</th>
+                <th class="num">Conv.</th>
+                <th class="num">$/intent</th>
+              </tr>
+            </thead>
+            <tbody data-llm-body></tbody>
+          </table>
+        </article>
+
+        <article class="health-card health-settle">
+          <div class="health-card-head">
+            <h3 class="health-card-title">Settlements (7 d)</h3>
+            <span class="health-card-meta" data-settle-meta></span>
+          </div>
+          <svg class="settle-chart" data-settle-chart aria-hidden="true"></svg>
+          <ul class="settle-list" data-settle-list></ul>
+        </article>
+      </div>
+    </section>
+
+    <!-- ═══════════ COLOPHON ═══════════ -->
+    <footer class="colophon">
+      <div class="colophon-rules" aria-hidden="true"></div>
+      <div class="colophon-grid">
+        <div class="colophon-block">
+          <div class="colophon-label">Glossary</div>
+          <dl>
+            <dt>A/B reset</dt>
+            <dd>Bankroll &amp; ledger zeroed for a fresh experimental window.</dd>
+            <dt>Intent</dt>
+            <dd>A trade the agent <em>wanted</em> to execute before gates filtered it.</dd>
+            <dt>Gate</dt>
+            <dd>A pre-trade check that may refuse an intent (volume, liquidity, cap).</dd>
+            <dt>Mark</dt>
+            <dd>Mid-price at the most recent observation, used for unrealised P/L.</dd>
+          </dl>
+        </div>
+        <div class="colophon-block">
+          <div class="colophon-label">Source &amp; method</div>
+          <p>
+            This page is a static hourly mirror of the live (private) trading desk. Numbers are
+            never adjusted; failed mirrors leave the previous edition in place. Charts rendered
+            client-side with D3.
+          </p>
+        </div>
+        <div class="colophon-block">
+          <div class="colophon-label">Edition</div>
+          <p data-colophon-edition>Vol. I &middot; No. 2026.05.06 &middot; Issued 06:04 UTC</p>
+          <p class="colophon-set">Set in Fraunces, Bricolage Grotesque &amp; JetBrains Mono.</p>
+        </div>
+      </div>
+    </footer>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
