@@ -1,872 +1,1251 @@
-/* ════════════════════════════════════════════════════════════════════════
-   The Speculator's Ledger — agent renderer for `/`.
+/* ============================================================================
+   polymarket-agent dashboard — "Night Desk" renderer (design-refresh v2)
+   Dependency-free. Reads the embedded #bootstrap-data payload (or fetches
+   ./data.json in dev / for liveness) and draws the whole operator view.
+   Payload shape == polymarket_agent.dashboard.app._build_payloads().
+   All DOM built with textContent / element nodes — no HTML string injection.
 
-   Reads the inline JSON state injected by templates/index.html
-   (`<script id="dashboard-state">…</script>`), adapts the agent's payload
-   shapes to the redesign's expected shapes, and renders every section
-   client-side using D3.
+   v2 design principles (multi-lens critique, 2026-06-10):
+   - every figure appears exactly ONCE, in its best encoding;
+   - loss-red is rationed to true exceptions, not ambient direction;
+   - the NAV line gets a data-fitted axis; composition gets its own 0-based
+     strip (a zero-forced shared axis flattened the drawdown);
+   - attention comes before the deep tables; the tape is deduplicated;
+   - health tells the truth: fresh data + zero trades = "gated", not "live".
+   ========================================================================== */
+(function () {
+  "use strict";
 
-   The agent's existing per-section partials (used by /api/sections/{name}
-   and the SSE stream) are unchanged — this script powers `/` only.
+  var MINUS = "−";
+  var app = document.getElementById("app");
 
-   Every string derived from data is escaped via esc() before it enters
-   any innerHTML construction, keeping the trust boundary clean.
-   ════════════════════════════════════════════════════════════════════════ */
-
-(() => {
-  const stateEl = document.getElementById("dashboard-state");
-  if (!stateEl) return;
-  let agent;
-  try {
-    agent = JSON.parse(stateEl.textContent || "{}");
-  } catch (e) {
-    console.error("dashboard: bad inline state", e);
-    return;
-  }
-
-  /* ─────────────────  ADAPTERS  (agent payload → redesign shape)  ───────────
-     The agent's _build_payloads() returns dicts shaped for the legacy Jinja
-     templates. The redesign expects flatter shapes; these helpers translate.
-  */
-  const _safe = (v) => (typeof v === "number" && isFinite(v) ? v : 0);
-  function _adaptBankroll(b) {
-    if (!b || b.is_empty) return { last_24h: [], last_7d: [], since_reset: [] };
-    const map = (arr) =>
-      (arr || []).map((p) => ({
-        ts: p.ts,
-        balance_usd: typeof p.balance_usd === "number" ? p.balance_usd : _safe(p.value),
-      }));
-    return {
-      last_24h: map(b.points_24h),
-      last_7d: map(b.points_7d),
-      since_reset: map(b.points_since_reset),
-    };
-  }
-  function _adaptStrategies(s) {
-    if (!s || !Array.isArray(s.strategies)) return [];
-    return s.strategies.map((st) => ({
-      name: st.name,
-      pl: _safe(st.realised_since_reset_usd),
-      open: _safe(st.open_positions),
-      deployed: _safe(st.deployed_usd),
-      wins: _safe(st.wins),
-      losses: _safe(st.losses),
-      win_rate: typeof st.win_rate === "number" ? st.win_rate : null,
-      llm: !!st.is_llm_strategy,
-      usd_per_call:
-        typeof st.dollars_per_llm_call === "number" ? st.dollars_per_llm_call : null,
-      intents_per_1000:
-        typeof st.intents_per_thousand_decisions_24h === "number"
-          ? st.intents_per_thousand_decisions_24h
-          : 0,
-      intents: _safe(st.intents_24h),
-      evals: _safe(st.decisions_24h),
-    }));
-  }
-  function _adaptOpenBook(o) {
-    if (!o || !Array.isArray(o.items)) return [];
-    return o.items.map((it) => ({
-      market: it.question || it.market_id || "—",
-      outcome: it.outcome_name || "",
-      side: it.side || "LONG",
-      entry: _safe(it.avg_entry_price),
-      mark: _safe(it.mark_price),
-      cost: _safe(it.cost_basis_usd),
-      unrealised: typeof it.unrealised_pnl_usd === "number" ? it.unrealised_pnl_usd : 0,
-      hrs_left: typeof it.hours_to_resolution === "number" ? it.hours_to_resolution : 0,
-    }));
-  }
-  function _adaptRefusals(r) {
-    if (!r || !Array.isArray(r.by_reason)) return [];
-    return r.by_reason.map((x) => ({ reason_code: x.reason_code, count: _safe(x.count) }));
-  }
-  function _adaptSettlements(s) {
-    if (!s || !Array.isArray(s.last_24h)) return [];
-    return s.last_24h.map((it) => ({
-      market_id: it.market_id || "",
-      outcome: it.outcome || "",
-      usd_per_share: _safe(it.payout_per_share_usd),
-      total: _safe(it.payout_total_usd),
-    }));
-  }
-  function _adaptSettlements7d(s) {
-    if (!s || !Array.isArray(s.buckets_7d)) return [];
-    return s.buckets_7d.map((b) => ({
-      date: b.date,
-      wins: _safe(b.wins),
-      losses: _safe(b.losses),
-      paid_usd: _safe(b.paid_usd),
-    }));
-  }
-  function _adaptLLM(l) {
-    if (!l || !Array.isArray(l.strategies)) return [];
-    return l.strategies.map((row) => ({
-      strategy: row.strategy_name || row.name || "",
-      calls: _safe(row.calls_24h ?? row.calls),
-      intents: _safe(row.intents_24h ?? row.intents),
-      conv:
-        typeof row.conversion === "string"
-          ? row.conversion
-          : typeof row.intents_per_thousand_decisions_24h === "number"
-          ? (row.intents_per_thousand_decisions_24h / 10).toFixed(1) + "%"
-          : "—",
-      tokens_usd: row.tokens_usd ?? "—",
-    }));
-  }
-  function _adaptDecisions(d) {
-    if (!d || !Array.isArray(d.events)) return [];
-    return d.events.map((ev) => {
-      const ts = ev.ts ? new Date(ev.ts) : null;
-      const time =
-        ts && !isNaN(ts.getTime())
-          ? ts.toISOString().slice(11, 19)
-          : String(ev.ts || "").slice(11, 19);
-      return {
-        time,
-        event: ev.kind || "",
-        strategy: ev.strategy || "",
-        detail: ev.summary || "",
-      };
-    });
-  }
-  function _adaptWatchlist(w) {
-    if (!w || !Array.isArray(w.items)) return [];
-    return w.items.map((it) => ({
-      market: it.question || it.market_id || "",
-      yes_mid: it.yes_mid != null ? Number(it.yes_mid).toFixed(3) : "—",
-      no_mid: it.no_mid != null ? Number(it.no_mid).toFixed(3) : "—",
-      spread: it.spread != null ? Number(it.spread).toFixed(4) : "—",
-      gates: Array.isArray(it.passed_strategies) ? it.passed_strategies : [],
-    }));
-  }
-  function _buildMeta(agent) {
-    const b = agent.bankroll || {};
-    const sList = Array.isArray(agent.strategies && agent.strategies.strategies)
-      ? agent.strategies.strategies
-      : [];
-    return {
-      mode: agent.mode || "sim",
-      refreshed: b.window_end_iso || new Date().toISOString(),
-      reset_at: b.ab_reset_iso || b.window_end_iso || new Date().toISOString(),
-      bankroll_now: _safe(b.current_usd),
-      bankroll_24h_pct: typeof b.delta_24h_pct === "number" ? b.delta_24h_pct : 0,
-      bankroll_24h_abs: _safe(b.delta_24h_usd),
-      bankroll_reset_pct:
-        typeof b.delta_since_reset_pct === "number" ? b.delta_since_reset_pct : 0,
-      bankroll_reset_abs: _safe(b.delta_since_reset_usd),
-      open_positions: sList.reduce((a, x) => a + _safe(x.open_positions), 0),
-      strategies_count: sList.length,
-    };
-  }
-
-  const data = {
-    meta: _buildMeta(agent),
-    bankroll: _adaptBankroll(agent.bankroll),
-    refusals: _adaptRefusals(agent.refusals),
-    settlements_7d: _adaptSettlements7d(agent.settlements),
-    settlements: _adaptSettlements(agent.settlements),
-    open_book: _adaptOpenBook(agent.open_book),
-    llm_activity: _adaptLLM(agent.llm_activity),
-    decisions: _adaptDecisions(agent.decisions),
-    watchlist: _adaptWatchlist(agent.watchlist),
-    strategies: _adaptStrategies(agent.strategies),
+  /* ---------- UI state (persisted across re-renders) --------------------- */
+  var ui = {
+    range: "since_reset",
+    ledgerSort: { key: "roi", dir: -1 },
+    bookSort: { key: "unrealised", dir: 1 },
+    watch: "",
+    dormantOpen: false,
+    bookOpen: null            // cluster-name -> bool; null = use defaults
   };
+  var state = null;     // raw payload
+  var els = {};         // live element refs for in-place updates
+  var pollTimer = null, ageTimer = null, pollFails = 0;
 
-  /* ─────────────────────  THEME  ─────────────────────
-     Two editions, dark and light. Persist choice across visits. */
-  const root = document.documentElement;
-  const STORAGE_KEY = "speculators-ledger-theme";
-  function applyTheme(theme) {
-    root.setAttribute("data-theme", theme);
-    const label = document.querySelector("[data-theme-label]");
-    if (label) label.textContent = theme === "light" ? "Night" : "Morning";
+  /* ---------- formatting -------------------------------------------------- */
+  function nf(v, dp) {
+    return Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: dp, maximumFractionDigits: dp });
   }
-  const saved = (() => { try { return localStorage.getItem(STORAGE_KEY); } catch { return null; } })();
-  if (saved === "light" || saved === "dark") applyTheme(saved);
-  function readVar(name, fallback) {
-    const v = getComputedStyle(root).getPropertyValue(name).trim();
-    return v || fallback;
+  function money(v, dp) {
+    if (v == null || isNaN(v)) return "—";
+    dp = dp == null ? 2 : dp;
+    return (v < 0 ? MINUS : "") + "$" + nf(v, dp);
   }
-  function bindThemeToggle() {
-    const btn = document.querySelector("[data-theme-toggle]");
-    if (!btn) return;
-    btn.addEventListener("click", () => {
-      const next = root.getAttribute("data-theme") === "light" ? "dark" : "light";
-      applyTheme(next);
-      try { localStorage.setItem(STORAGE_KEY, next); } catch {}
-      // re-render charts with new theme colors
-      const active = document.querySelector("[data-range].is-active");
-      renderEquity(active ? active.dataset.range : "since_reset");
-      renderSettlements();
+  function moneySigned(v, dp) {
+    if (v == null || isNaN(v)) return "—";
+    dp = dp == null ? 2 : dp;
+    return (v > 0 ? "+" : v < 0 ? MINUS : "") + "$" + nf(v, dp);
+  }
+  function moneyCompact(v) {
+    if (v == null || isNaN(v)) return "—";
+    var a = Math.abs(v), str;
+    if (a >= 1000) str = "$" + (a / 1000).toFixed(a >= 10000 ? 0 : 1) + "k";
+    else str = "$" + a.toFixed(0);
+    return (v < 0 ? MINUS : "") + str;
+  }
+  function pctSigned(v, dp) {
+    if (v == null || isNaN(v)) return "";
+    dp = dp == null ? 1 : dp;
+    return (v > 0 ? "+" : v < 0 ? MINUS : "") + Math.abs(v).toFixed(dp) + "%";
+  }
+  function pctFrac(v, dp) {
+    if (v == null || isNaN(v)) return "—";
+    dp = dp == null ? 0 : dp;
+    return (v < 0 ? MINUS : "") + Math.abs(v * 100).toFixed(dp) + "%";
+  }
+  function intc(v) { return v == null ? "—" : Number(v).toLocaleString("en-US"); }
+  function sgn(v) { return v > 0 ? "pos" : v < 0 ? "neg" : ""; }
+  // Color policy: routine values are neutral ink with a sign; saturated
+  // profit/loss color is reserved for exceptions the eye must find.
+  function exc(v, threshold) { return Math.abs(v || 0) >= (threshold == null ? 50 : threshold) ? sgn(v) : ""; }
+
+  function parseTs(str) { var t = Date.parse(str); return isNaN(t) ? null : t; }
+  function ageMs(iso) { var t = parseTs(iso); return t == null ? null : Date.now() - t; }
+  function relAge(ms) {
+    if (ms == null) return "unknown";
+    var m = Math.round(ms / 60000);
+    if (m < 1) return "just now";
+    if (m < 60) return m + "m ago";
+    var hr = Math.floor(m / 60);
+    if (hr < 24) return hr + "h " + (m % 60) + "m ago";
+    return Math.floor(hr / 24) + "d ago";
+  }
+  function resolves(hrs) {
+    if (hrs == null) return "—";
+    if (hrs < 0) return "expired";
+    if (hrs < 48) return hrs.toFixed(0) + "h";
+    var d = hrs / 24;
+    return d.toFixed(d < 10 ? 1 : 0) + "d";
+  }
+  function shortDate(iso) {
+    var d = new Date(iso);
+    if (isNaN(d)) return "";
+    return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short" });
+  }
+  function clockTime(iso) {
+    var d = new Date(iso);
+    if (isNaN(d)) return String(iso || "");
+    return d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+  }
+
+  /* ---------- tiny DOM builders (text/nodes only) ------------------------ */
+  function h(tag, attrs, kids) {
+    var e = document.createElement(tag);
+    if (attrs) for (var k in attrs) {
+      var v = attrs[k];
+      if (v == null || v === false) continue;
+      if (k === "class") e.className = v;
+      else if (k === "text") e.textContent = v;
+      else if (k === "dataset") { for (var d in v) e.dataset[d] = v[d]; }
+      else if (k.slice(0, 2) === "on" && typeof v === "function") e.addEventListener(k.slice(2), v);
+      else e.setAttribute(k, v);
+    }
+    if (kids != null) add(e, kids);
+    return e;
+  }
+  function add(e, c) {
+    if (Array.isArray(c)) { for (var i = 0; i < c.length; i++) add(e, c[i]); }
+    else if (c == null || c === false) { /* skip */ }
+    else if (c.nodeType) e.appendChild(c);
+    else e.appendChild(document.createTextNode(String(c)));
+  }
+  function clear(e) { if (e) e.replaceChildren(); }
+  var SVGNS = "http://www.w3.org/2000/svg";
+  function s(tag, attrs) {
+    var e = document.createElementNS(SVGNS, tag);
+    if (attrs) for (var k in attrs) if (attrs[k] != null) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+
+  /* ---------- derivations ------------------------------------------------ */
+  function navOf(p) { return p && p.nav_usd != null ? p.nav_usd : (p ? p.balance_usd : null); }
+  function navStats(st) {
+    // Net asset value = cash + market value of open positions. The raw cash
+    // bankroll overstates drawdown because deployed capital still has value.
+    var b = st.bankroll || {};
+    var ob = (st.open_book || {}).items || [];
+    var cash = b.cash_now_usd != null ? b.cash_now_usd : b.current_usd;
+    var deployed = b.deployed_cost_usd != null ? b.deployed_cost_usd
+      : ob.reduce(function (a, it) { return a + (it.cost_basis_usd || 0); }, 0);
+    var unreal = b.unrealised_total_usd != null ? b.unrealised_total_usd
+      : ob.reduce(function (a, it) { return a + (it.unrealised_pnl_usd || 0); }, 0);
+    var posval = b.positions_value_usd != null ? b.positions_value_usd : ((deployed || 0) + (unreal || 0));
+    var nav = b.nav_usd != null ? b.nav_usd : ((cash || 0) + posval);
+    var navDelta = b.nav_delta_since_reset_usd, navPct = b.nav_delta_since_reset_pct;
+    if (navDelta == null) {  // fallback when the backend hasn't supplied it
+      var pts = b.points_since_reset || [];
+      var resetNav = pts.length ? navOf(pts[0]) : nav;
+      navDelta = nav - resetNav; navPct = resetNav ? navDelta / resetNav * 100 : null;
+    }
+    var fees = b.fees_other_usd;
+    if (fees == null && navDelta != null && b.realised_total_usd != null) {
+      fees = navDelta - b.realised_total_usd - (unreal || 0);
+    }
+    return {
+      cash: cash, deployed: deployed, unreal: unreal, posval: posval, nav: nav,
+      navDelta: navDelta, navPct: navPct, realised: b.realised_total_usd,
+      fees: fees, cashDelta: b.delta_since_reset_usd, cashPct: b.delta_since_reset_pct,
+      // The reconciliation identity must balance; if it doesn't, the UI says
+      // so out loud instead of rendering a tidy ≡ over broken numbers.
+      reconciles: (navDelta != null && b.realised_total_usd != null)
+        ? Math.abs((b.realised_total_usd + (unreal || 0) + (fees || 0)) - navDelta) <= 1
+        : true
+    };
+  }
+  function deriveEquity(points) {
+    if (!points || !points.length) return null;
+    var high = -Infinity, low = Infinity, peak = -Infinity, maxdd = 0, peakIdx = 0;
+    var rets = [], prev = null;
+    for (var i = 0; i < points.length; i++) {
+      var b = navOf(points[i]);
+      if (b > high) high = b;
+      if (b < low) low = b;
+      if (b > peak) { peak = b; peakIdx = i; }
+      if (peak > 0) maxdd = Math.max(maxdd, (peak - b) / peak);
+      if (prev != null && prev !== 0) rets.push((b - prev) / prev);
+      prev = b;
+    }
+    var mean = rets.reduce(function (a, b) { return a + b; }, 0) / (rets.length || 1);
+    var varc = rets.reduce(function (a, b) { return a + (b - mean) * (b - mean); }, 0) / (rets.length || 1);
+    return {
+      high: high, low: low, maxdd: maxdd, vol: Math.sqrt(varc),
+      first: navOf(points[0]), last: navOf(points[points.length - 1]),
+      peak: peak, peakIdx: peakIdx
+    };
+  }
+  function prepStrategies(arr) {
+    return (arr || []).map(function (st) {
+      var realised = st.realised_since_reset_usd || 0;
+      var deployed = st.deployed_usd || 0;
+      var roi = deployed > 0 ? realised / deployed : null;
+      var group = Math.abs(realised) <= 0.01 ? "dormant" : (realised > 0 ? "earning" : "bleeding");
+      return Object.assign({}, st, { realised: realised, deployed: deployed, roi: roi, group: group });
     });
   }
-
-  /* ─────────────────────  helpers  ───────────────────── */
-  const esc = (s) =>
-    String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
-      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
-    );
-  const escAttr = (s) => String(s == null ? "" : s).replace(/"/g, "&quot;");
-
-  const fmtMoney0 = (n) =>
-    (n < 0 ? "−" : "") + "$" + Math.abs(n).toLocaleString("en-US", { maximumFractionDigits: 0 });
-  const fmtMoney2 = (n) =>
-    (n < 0 ? "−" : "") + "$" + Math.abs(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  const fmtSigned = (n, d = 2) =>
-    (n > 0 ? "+" : n < 0 ? "−" : "") + Math.abs(n).toFixed(d);
-  const fmtPct = (n, d = 2) => (n > 0 ? "+" : n < 0 ? "−" : "") + Math.abs(n * 100).toFixed(d) + "%";
-  const fmtCount = (n) => Number(n).toLocaleString("en-US");
-
-  function fmtResolves(hrs) {
-    if (hrs < 0) return { rel: "settled" };
-    if (hrs < 1) return { rel: Math.round(hrs * 60) + "m" };
-    if (hrs < 48) return { rel: hrs.toFixed(1) + " h" };
-    const days = hrs / 24;
-    if (days < 30) return { rel: Math.round(days) + " d" };
-    if (days < 365) return { rel: (days / 30.4).toFixed(1) + " mo" };
-    return { rel: (days / 365).toFixed(1) + " yr" };
+  function pairedConditions(items) {
+    var m = {}, paired = {};
+    (items || []).forEach(function (it) {
+      var c = it.condition_id; if (!c) return;
+      (m[c] = m[c] || {})[it.token_id] = 1;
+    });
+    for (var c in m) if (Object.keys(m[c]).length > 1) paired[c] = 1;
+    return paired;
   }
 
-  /* ─────────────────────  HERO LEDE & KPIs  ───────────────────── */
-  function renderHero() {
-    const m = data.meta;
-    document.querySelector("[data-bankroll-value]").textContent = m.bankroll_now.toLocaleString(
-      "en-US",
-      { minimumFractionDigits: 2, maximumFractionDigits: 2 }
-    );
-
-    const refr = new Date(m.refreshed);
-    const refrStr = refr.toLocaleString("en-GB", {
-      day: "numeric", month: "short", hour: "2-digit", minute: "2-digit",
-      timeZone: "UTC",
+  /* ---------- open-book theme clustering ---------------------------------
+     The flat list hides the structural fact that most of the book is one
+     correlated macro bet. Clustering is a conservative token heuristic —
+     families we can defend, everything else falls into "Other markets". */
+  var THEMES = [
+    [/iran|hormuz|strait/i, "Iran & Hormuz"],
+    [/world cup|fifa/i, "FIFA World Cup"],
+    [/nba|nfl|mlb|nhl|padres|giants|thunder|lakers|yankees/i, "US sports"],
+    [/bitcoin|btc|ethereum|\beth\b|crypto|microstrategy|coinbase|solana/i, "Crypto"],
+    [/\bfed\b|interest rate|inflation|cpi|gdp|recession/i, "Macro & rates"],
+    [/ukraine|russia/i, "Ukraine–Russia"],
+    [/taiwan|china/i, "China–Taiwan"]
+  ];
+  function themeOf(question) {
+    var q = String(question || "");
+    for (var i = 0; i < THEMES.length; i++) if (THEMES[i][0].test(q)) return THEMES[i][1];
+    return "Other markets";
+  }
+  function clusterBook(items) {
+    var by = {};
+    (items || []).forEach(function (it) {
+      var expired = it.hours_to_resolution != null && it.hours_to_resolution < 0;
+      var key = expired ? "Awaiting settlement" : themeOf(it.question);
+      var c = by[key] || (by[key] = { name: key, items: [], cost: 0, unreal: 0, settling: expired });
+      c.items.push(it);
+      c.cost += it.cost_basis_usd || 0;
+      c.unreal += it.unrealised_pnl_usd || 0;
     });
-    document.querySelector("[data-as-of]").textContent = "as of " + refrStr + " UTC";
-    document.querySelector("[data-refreshed]").textContent = refrStr + " UTC";
-
-    const ed = refr.toISOString().slice(0, 10);
-    document.querySelector("[data-edition]").textContent = "No. " + ed;
-    document.querySelector("[data-colophon-edition]").textContent =
-      "Vol. I · No. " + ed + " · Issued " + refrStr + " UTC";
-
-    const totalRefusals = data.refusals.reduce((a, b) => a + b.count, 0);
-    document.querySelector("[data-lede-evals]").textContent = totalRefusals.toLocaleString();
-    const resetD = new Date(m.reset_at).toLocaleString("en-GB", {
-      day: "numeric", month: "short", timeZone: "UTC",
+    var clusters = Object.keys(by).map(function (k) { return by[k]; });
+    clusters.sort(function (a, b) {
+      if (a.settling !== b.settling) return a.settling ? 1 : -1;  // settling last
+      return b.cost - a.cost;
     });
-    document.querySelector("[data-lede-reset-date]").textContent = resetD;
-    document.querySelector("[data-lede-24h]").textContent = fmtMoney0(Math.abs(m.bankroll_24h_abs));
-    document.querySelector("[data-lede-reset]").textContent = fmtMoney0(Math.abs(m.bankroll_reset_abs));
+    return clusters;
   }
 
-  /* ─────────────────────  I — EQUITY CURVE  ───────────────────── */
-  function renderEquity(rangeKey = "since_reset") {
-    const rawSeries = data.bankroll[rangeKey] || data.bankroll.since_reset;
-    const series = rawSeries.map((d) => ({ ts: new Date(d.ts), v: d.balance_usd }));
-    const baseline = series[0].v;
-    const last = series[series.length - 1].v;
+  /* ---------- health & attention flags ----------------------------------- */
+  function latestDataIso(st) {
+    // Freshness must track the latest *data*, not the payload build time:
+    // bankroll.window_end_iso is set to "now" on every request, so it can
+    // never reveal a stalled agent/DB writer. Anchor on the newest bankroll
+    // observation (falling back to the last equity point, then build time).
+    var b = st.bankroll || {};
+    if (b.as_of_iso) return b.as_of_iso;
+    var p = b.points_since_reset || b.points_7d || b.points_24h;
+    if (p && p.length) return p[p.length - 1].ts;
+    return b.window_end_iso || null;
+  }
+  function healthOf(st) {
+    var iso = latestDataIso(st);
+    var ms = ageMs(iso), cls = "is-live", txt = "Live";
+    // Tuned for an ~hourly mirror over ~hourly bankroll cadence: a fresh
+    // public snapshot stays green; a multi-hour gap means the agent or the
+    // publish pipeline has stalled.
+    if (ms == null) { cls = "is-stale"; txt = "Unknown"; }
+    else if (ms > 8 * 3600e3) { cls = "is-stale"; txt = "Stale"; }
+    else if (ms > 2 * 3600e3) { cls = "is-warn"; txt = "Lagging"; }
+    return { cls: cls, txt: txt, ms: ms, iso: iso };
+  }
+  function tradingStateOf(st) {
+    // Fresh data is only half the truth — a live process that places zero
+    // trades because every signal hits a gate is "gated", not "trading".
+    var strat = (st.strategies || {}).strategies || [];
+    var intents = strat.reduce(function (a, s2) { return a + (s2.intents_24h || 0); }, 0);
+    var ev = (st.decisions || {}).events || [];
+    var acted = ev.some(function (e) {
+      var k = (e.kind || "").toLowerCase();
+      return k && k.indexOf("refus") < 0 && (k.indexOf("fill") >= 0 || k.indexOf("order") >= 0 || k.indexOf("intent") >= 0);
+    });
+    var ref = st.refusals || {};
+    var topGate = (ref.by_reason && ref.by_reason[0]) || null;
+    return {
+      intents: intents, acted: acted, refusals: ref.total || 0,
+      gated: !acted && intents === 0 && (ref.total || 0) > 0,
+      topGate: topGate
+    };
+  }
+  // One severity-ordered flag list, computed once and shared by the status
+  // bar (top alert chip) and the Attention panel. sev: bad > warn > ok.
+  function computeFlags(st) {
+    var flags = [];
+    var hh = healthOf(st);
+    if (hh.cls === "is-stale") flags.push({ sev: "bad", ico: "!", head: "Data is stale", note: "Last update " + relAge(hh.ms) + " — the mirror or the agent may be stalled." });
+    else if (hh.cls === "is-warn") flags.push({ sev: "warn", ico: "~", head: "Data lagging", note: "Last update " + relAge(hh.ms) + "." });
 
-    const high = series.reduce((a, b) => (b.v > a.v ? b : a));
-    const low = series.reduce((a, b) => (b.v < a.v ? b : a));
-    const drawdownAbs = high.v - last;
-    const drawdownPct = drawdownAbs / high.v;
+    var ns = navStats(st);
+    if (!ns.reconciles) {
+      flags.push({ sev: "bad", ico: "≠", head: "Reconciliation does not balance", note: "realised + unrealised + fees do not sum to the net-worth change — treat decomposed figures with suspicion." });
+    }
 
-    // Hourly volatility — resample series into 1h bins (last value per bin),
-    // then take stdev of bin-to-bin changes. This avoids the "many ticks
-    // within the same second" pathology that distorts naive Δv/Δt.
-    let vol1h = 0;
-    if (series.length > 2) {
-      const bins = new Map();
-      for (const p of series) {
-        const k = Math.floor(p.ts.getTime() / 3600000);
-        bins.set(k, p.v); // last write wins → close-of-bin
-      }
-      const sortedKeys = [...bins.keys()].sort((a, b) => a - b);
-      const closes = sortedKeys.map((k) => bins.get(k));
-      if (closes.length > 1) {
-        const deltas = [];
-        for (let i = 1; i < closes.length; i++) deltas.push(closes[i] - closes[i - 1]);
-        const mean = deltas.reduce((a, b) => a + b, 0) / deltas.length;
-        const varc = deltas.reduce((a, b) => a + (b - mean) ** 2, 0) / deltas.length;
-        vol1h = Math.sqrt(varc);
+    var ts = tradingStateOf(st);
+    if (ts.gated) {
+      var gateNote = intc(ts.refusals) + " signals refused in the window";
+      if (ts.topGate) gateNote += " · top gate: " + ts.topGate.reason_code + " (" + Math.round(ts.topGate.count / Math.max(ts.refusals, 1) * 100) + "%)";
+      flags.push({ sev: "warn", ico: "⛔", head: "0 trades — every signal gated", note: gateNote + "." });
+    } else if (ts.refusals > 0 && ts.topGate && ts.topGate.count / ts.refusals >= 0.6) {
+      flags.push({ sev: "warn", ico: "⚑", head: Math.round(ts.topGate.count / ts.refusals * 100) + "% of refusals: " + ts.topGate.reason_code, note: intc(ts.refusals) + " refusals dominated by one gate — check it isn't mis-set." });
+    }
+
+    // Fees/other — the NAV residual (same number the reconciliation shows).
+    // Never flag the cash-vs-NAV wedge here: that is deployed capital, and it
+    // is explained in the hero, not "unexplained".
+    if (ns.fees != null && Math.abs(ns.fees) > Math.max(50, Math.abs(ns.navDelta || 0) * 0.10)) {
+      flags.push({ sev: "warn", ico: "≈", head: "Fees/other " + moneySigned(ns.fees, 0), note: "Residual of the net-worth change not in realised or unrealised P/L." });
+    }
+
+    var items = (st.open_book || {}).items || [];
+    var clusters = clusterBook(items).filter(function (c) { return !c.settling; });
+    var costAll = clusters.reduce(function (a, c) { return a + c.cost; }, 0);
+    if (clusters.length && costAll > 0) {
+      var top = clusters[0], share = top.cost / costAll;
+      if (share >= 0.4) flags.push({ sev: "warn", ico: "◉", head: "Concentration: " + top.name + " = " + Math.round(share * 100) + "% of deployed", note: top.items.length + " positions, " + moneyCompact(top.cost) + " at cost — one thesis dominates the book." });
+    }
+
+    var strat = prepStrategies((st.strategies || {}).strategies);
+    var worst = strat.slice().sort(function (a, b) { return a.realised - b.realised; })[0];
+    if (worst && worst.realised < -100) flags.push({ sev: "warn", ico: "▼", head: "Biggest bleed: " + worst.name, note: moneySigned(worst.realised, 0) + " realised since reset" + (worst.roi != null ? " · ROI " + pctFrac(worst.roi, 0) : "") + "." });
+    var best = strat.slice().sort(function (a, b) { return b.realised - a.realised; })[0];
+    if (best && best.realised > 1) flags.push({ sev: "ok", ico: "▲", head: "Top earner: " + best.name, note: moneySigned(best.realised, 0) + " realised" + (best.roi != null ? " · ROI " + pctFrac(best.roi, 0) : "") + "." });
+    if (!flags.length) flags.push({ sev: "ok", ico: "✓", head: "Nothing flagged", note: "No staleness, gate cliffs or unexplained P/L." });
+
+    var rank = { bad: 0, warn: 1, ok: 2 };
+    flags.sort(function (a, b) { return rank[a.sev] - rank[b.sev]; });
+    return flags;
+  }
+
+  /* ---------- status bar -------------------------------------------------- */
+  function renderStatusbar(st, flags) {
+    var hh = healthOf(st);
+    var ts = tradingStateOf(st);
+    var openN = (st.open_book && st.open_book.count) || 0;
+    var theme = document.documentElement.getAttribute("data-theme") || "dark";
+
+    // Health verdict is composite: freshness first, then trading state.
+    var verdict = hh.txt, vcls = hh.cls;
+    if (hh.cls === "is-live" && ts.gated) { verdict = "Gated"; vcls = "is-warn"; }
+
+    var ageEl = h("span", { class: "health-age", text: relAge(hh.ms) });
+    var cluster = h("div", { class: "statusbar-cluster" });
+
+    // Top alert chip — the single most severe flag, always in view.
+    var alert = (flags || []).find(function (f) { return f.sev === "bad" || f.sev === "warn"; });
+    if (alert) {
+      cluster.appendChild(h("span", { class: "alert-chip is-" + alert.sev, title: alert.note }, [
+        h("span", { class: "alert-ico", text: alert.ico }),
+        h("span", { class: "alert-txt", text: alert.head })
+      ]));
+    }
+    cluster.appendChild(h("span", { class: "health " + vcls, title: (hh.iso || "") + (ts.gated ? " · fresh data, zero trades placed" : "") }, [
+      h("span", { class: "health-dot" }),
+      h("span", { class: "health-text", text: verdict }),
+      ageEl
+    ]));
+    cluster.appendChild(h("span", { class: "chip is-mode" }, [document.createTextNode("mode "), h("b", { text: st.mode || "—" })]));
+    cluster.appendChild(h("span", { class: "chip" }, [h("b", { text: intc(openN) }), document.createTextNode(" open")]));
+    cluster.appendChild(h("button", {
+      class: "edition-toggle", type: "button", "data-theme-toggle": "1",
+      "aria-label": "Toggle morning / night edition", onclick: toggleTheme
+    }, [
+      h("span", { class: "ico", text: theme === "light" ? "☾" : "☀" }),
+      h("span", { class: "lbl", text: theme === "light" ? "Night" : "Morning" })
+    ]));
+
+    var bar = h("header", { class: "statusbar" }, h("div", { class: "statusbar-inner" }, [
+      h("div", { class: "brand" }, [
+        h("span", { class: "brand-mark" }, ["polymarket", h("b", { text: "·" }), "agent"]),
+        h("span", { class: "brand-sub", text: "trading desk" })
+      ]),
+      cluster
+    ]));
+    els.age = ageEl;
+    return bar;
+  }
+
+  /* ---------- standings (hero) -------------------------------------------
+     Consolidated: the giant NAV figure + delta, ONE relief lane carrying the
+     page's thesis (NAV vs cash), ONE allocation/decomposition block, and a
+     four-tile KPI rail of facts that appear nowhere else. No prose recital,
+     no triple-stated numbers. */
+  function renderStandings(st) {
+    var ns = navStats(st);
+    var b = st.bankroll || {};
+    var strat = prepStrategies((st.strategies || {}).strategies);
+    var profitable = strat.filter(function (s2) { return s2.group === "earning"; }).length;
+    var openCount = (st.open_book || {}).count || ((st.open_book || {}).items || []).length;
+    var eq = deriveEquity(b.points_since_reset);
+
+    var sec = h("section", { class: "standings reveal", id: "standings" });
+    var resetDate = b.ab_reset_iso ? shortDate(b.ab_reset_iso) : "—";
+
+    sec.appendChild(h("div", { class: "eyebrow" }, [
+      h("span", { text: "Net asset value" }), h("span", { class: "rule" }),
+      h("span", { text: "cash + open positions · since reset " + resetDate })
+    ]));
+
+    var grid = h("div", { class: "standings-grid" });
+
+    // -- left: the number, its delta, and the one-line thesis.
+    var lead = h("div", { class: "standings-lead" });
+    lead.appendChild(h("div", { class: "figure" }, [
+      h("span", { class: "figure-cur", text: "$" }),
+      h("span", { class: "figure-num", text: ns.nav != null ? nf(ns.nav, 2) : "—" })
+    ]));
+    lead.appendChild(h("div", { class: "figure-delta" }, [
+      h("span", { class: sgn(ns.navDelta), text: moneySigned(ns.navDelta) }),
+      h("span", { class: "pct " + sgn(ns.navPct), text: pctSigned(ns.navPct) }),
+      h("span", { class: "since", text: "net worth since reset" })
+    ]));
+    lead.appendChild(reliefLane(ns));
+    grid.appendChild(lead);
+
+    // -- right rail: allocation + decomposition (once), then the KPI rail.
+    var rail = h("div", { class: "standings-rail" });
+    rail.appendChild(navBlock(ns, openCount));
+
+    var dd = eq ? eq.maxdd : null;
+    var has24h = ((b.points_24h || []).length > 0);
+    var d24u = b.nav_delta_24h_usd != null ? b.nav_delta_24h_usd : b.delta_24h_usd;
+    var d24p = b.nav_delta_24h_pct != null ? b.nav_delta_24h_pct : b.delta_24h_pct;
+    var items = (st.open_book || {}).items || [];
+    var nextHrs = items.reduce(function (a, it) {
+      var hrs = it.hours_to_resolution;
+      return (hrs != null && hrs >= 0 && (a == null || hrs < a)) ? hrs : a;
+    }, null);
+    var soon = items.filter(function (it) { return it.hours_to_resolution != null && it.hours_to_resolution >= 0 && it.hours_to_resolution <= 48; }).length;
+    var kpis = h("dl", { class: "kpis" }, [
+      kpi("Max drawdown", h("span", { class: "num", text: dd != null ? MINUS + (dd * 100).toFixed(1) + "%" : "—" }), "on NAV, since reset"),
+      // Absence and a true zero must not share an encoding: with no 24h
+      // points in this snapshot, say "no data", not a confident $0.00.
+      has24h
+        ? kpi("24-hour", h("span", { class: "num " + exc(d24u, 25), text: moneySigned(d24u, 2) }), d24p != null ? pctSigned(d24p) : null)
+        : kpi("24-hour", h("span", { class: "num dim", text: "—" }), "no 24h data in this snapshot"),
+      kpi("Strategies", h("span", { class: "num", text: intc(strat.length) }), profitable + " in profit"),
+      kpi("Next resolve", h("span", { class: "num", text: nextHrs != null ? resolves(nextHrs) : "—" }), soon ? soon + " resolve within 48h" : null)
+    ]);
+    rail.appendChild(kpis);
+    grid.appendChild(rail);
+
+    sec.appendChild(grid);
+    return sec;
+  }
+  function kpi(label, valueNode, sub) {
+    return h("div", { class: "kpi" }, [
+      h("dt", { text: label }),
+      h("dd", {}, [valueNode, sub ? h("small", { text: sub }) : null])
+    ]);
+  }
+  // The single comparative insight the page exists to deliver, as a
+  // first-class element in relief colors (amber = context, not alarm).
+  function reliefLane(ns) {
+    var lane = h("div", { class: "relief" });
+    if (ns.navPct == null || ns.cashPct == null) return lane;
+    var pts = ns.navPct - ns.cashPct;
+    lane.appendChild(h("span", { class: "relief-cash" }, [
+      document.createTextNode("cash line "),
+      h("b", { class: "num", text: pctSigned(ns.cashPct) })
+    ]));
+    lane.appendChild(h("span", { class: "relief-arrow", text: "▸" }));
+    lane.appendChild(h("span", { class: "relief-pts" }, [
+      h("b", { class: "num", text: pctSigned(pts, 1).replace("%", " pts") }),
+      document.createTextNode(" of that is capital deployed, not lost")
+    ]));
+    return lane;
+  }
+  // ONE allocation + decomposition block: where the money is, why it changed.
+  function navBlock(ns, openCount) {
+    var wrap = h("div", { class: "recon navblock" });
+    if (ns.nav == null) return wrap;
+    var cash = ns.cash || 0, pos = ns.posval || 0, total = (cash + pos) || 1;
+    wrap.appendChild(h("div", { class: "recon-label", text: "Where the money is · " + openCount + " open positions" }));
+    var bar = h("div", { class: "recon-bar" });
+    bar.appendChild(h("div", { class: "recon-seg cash", style: "width:" + (cash / total * 100) + "%" }));
+    bar.appendChild(h("div", { class: "recon-seg positions", style: "width:" + (pos / total * 100) + "%" }));
+    wrap.appendChild(bar);
+    wrap.appendChild(h("div", { class: "recon-keys" }, [
+      h("span", { class: "k" }, [h("span", { class: "sw", style: "background:var(--cash)" }), document.createTextNode("cash "), h("span", { class: "num", text: money(cash, 0) + " · " + Math.round(cash / total * 100) + "%" })]),
+      h("span", { class: "k" }, [h("span", { class: "sw", style: "background:var(--amber)" }), document.createTextNode("positions "), h("span", { class: "num", text: money(pos, 0) + " · " + Math.round(pos / total * 100) + "%" })]),
+      h("span", { class: "k faint" }, [document.createTextNode("at cost "), h("span", { class: "num", text: money(ns.deployed, 0) })])
+    ]));
+    if (ns.navDelta != null && ns.realised != null) {
+      wrap.appendChild(h("div", { class: "recon-label drivers-label", text: "Why it changed" }));
+      if (!ns.reconciles) {
+        wrap.appendChild(h("div", { class: "recon-keys recon-broken", text: "⚠ reconciliation does not balance — decomposed figures are suspect" }));
+      } else {
+        wrap.appendChild(h("div", { class: "recon-keys" }, [
+          h("span", { class: "k", style: "color:var(--ink)" }, [document.createTextNode("net "), h("span", { class: "num " + sgn(ns.navDelta), text: moneySigned(ns.navDelta, 0) }), document.createTextNode(" ≡")]),
+          h("span", { class: "k" }, [document.createTextNode("realised "), h("span", { class: "num", text: moneySigned(ns.realised, 0) })]),
+          h("span", { class: "k" }, [document.createTextNode("unrealised "), h("span", { class: "num", text: moneySigned(ns.unreal, 0) })]),
+          h("span", { class: "k" }, [document.createTextNode("fees/other "), h("span", { class: "num", text: moneySigned(ns.fees, 0) })])
+        ]));
       }
     }
-    document.querySelector("[data-stat-high]").textContent = fmtMoney0(high.v);
-    document.querySelector("[data-stat-low]").textContent = fmtMoney0(low.v);
-    const ddEl = document.querySelector("[data-stat-dd]");
-    ddEl.textContent = "−" + fmtMoney0(drawdownAbs) + "  " + fmtPct(-drawdownPct, 1);
-    ddEl.classList.add("loss");
-    document.querySelector("[data-stat-vol]").textContent = "$" + vol1h.toFixed(0) + "/h";
+    return wrap;
+  }
 
-    const svg = d3.select("[data-equity-chart]");
-    svg.selectAll("*").remove();
-    const wrapEl = svg.node().parentElement;
-    const wrapW = wrapEl.getBoundingClientRect().width || 720;
-    const W = Math.max(wrapW, 560);
-    const H = 360;
-    const M = { top: 18, right: 60, bottom: 32, left: 12 };
-    svg.attr("viewBox", `0 0 ${W} ${H}`).attr("preserveAspectRatio", "none");
+  /* ---------- folio header helper ---------------------------------------- */
+  function folio(num, id, title, deck, controls) {
+    var head = h("header", { class: "folio-head" }, [
+      h("div", { class: "folio-num", text: num }),
+      h("div", { class: "folio-titles" }, [
+        h("h2", { class: "folio-title", text: title }),
+        deck ? h("p", { class: "folio-deck" }, deck) : null
+      ]),
+      controls || h("span")
+    ]);
+    return h("section", { class: "folio reveal", id: id }, head);
+  }
 
-    const x = d3.scaleTime().domain(d3.extent(series, (d) => d.ts)).range([M.left, W - M.right]);
-    const yMin = Math.min(d3.min(series, (d) => d.v), baseline) * 0.985;
-    const yMax = Math.max(d3.max(series, (d) => d.v), baseline) * 1.015;
-    const y = d3.scaleLinear().domain([yMin, yMax]).range([H - M.bottom, M.top]);
-
-    const defs = svg.append("defs");
-    const grad = defs.append("linearGradient").attr("id", "equity-gradient")
-      .attr("x1", 0).attr("y1", 0).attr("x2", 0).attr("y2", 1);
-    const oxblood = readVar("--oxblood", "#c25c52");
-    grad.append("stop").attr("offset", "0%").attr("stop-color", oxblood).attr("stop-opacity", 0.18);
-    grad.append("stop").attr("offset", "100%").attr("stop-color", oxblood).attr("stop-opacity", 0);
-
-    const grid = svg.append("g").attr("class", "grid");
-    y.ticks(5).forEach((t) => {
-      grid.append("line")
-        .attr("x1", M.left).attr("x2", W - M.right)
-        .attr("y1", y(t)).attr("y2", y(t));
+  /* ---------- I — net asset value chart -----------------------------------
+     Two honest panels: the NAV line on a data-fitted axis (so the drawdown
+     reads at full resolution), and a thin 0-based composition strip below
+     (so cash-vs-deployed reads at true magnitude). A zero-forced single
+     panel flattened the very decline the page exists to show. */
+  function renderEquity(st) {
+    var b = st.bankroll || {};
+    var has24h = ((b.points_24h || []).length > 0);
+    var sec = folio("I", "equity", "Net asset value",
+      ["NAV on its own scale; the strip below shows how it splits into cash and deployed capital. The curve values positions at cost — the ring at the end marks them to market."],
+      seg([["last_24h", "24H", !has24h], ["last_7d", "7D"], ["since_reset", "Reset"]], ui.range, function (r) {
+        ui.range = r; drawEquity(st);
+      }));
+    var rail = h("div", { class: "equity-rail" });
+    var plot = h("div", { class: "equity-plot" });
+    var svg = s("svg", { class: "equity-svg", preserveAspectRatio: "none", viewBox: "0 0 800 300" });
+    var tip = h("div", { class: "equity-tip" });
+    plot.appendChild(svg);
+    plot.appendChild(h("div", { class: "equity-axis-y", "data-axis-y": "1" }));
+    plot.appendChild(h("div", { class: "equity-overlays", "data-overlays": "1" }));
+    plot.appendChild(tip);
+    var comp = h("div", { class: "equity-comp" });
+    var compSvg = s("svg", { class: "equity-comp-svg", preserveAspectRatio: "none", viewBox: "0 0 800 64" });
+    comp.appendChild(compSvg);
+    comp.appendChild(h("span", { class: "comp-label", text: "composition" }));
+    var xaxis = h("div", { class: "equity-axis-x", "data-axis-x": "1" });
+    var legend = h("div", { class: "equity-legend" }, [
+      h("span", { class: "k" }, [h("span", { class: "swline" }), document.createTextNode("net asset value (at cost)")]),
+      h("span", { class: "k" }, [h("span", { class: "sw", style: "background:var(--cash)" }), document.createTextNode("cash")]),
+      h("span", { class: "k" }, [h("span", { class: "sw", style: "background:var(--amber)" }), document.createTextNode("deployed")]),
+      h("span", { class: "k faint", text: "dotted = opening NAV · dot = peak · ring = marked to market" })
+    ]);
+    sec.appendChild(h("div", { class: "equity" }, [rail, h("div", { class: "equity-main" }, [plot, comp, xaxis, legend])]));
+    els.equityRail = rail; els.equitySvg = svg; els.equityTip = tip; els.equityPlot = plot;
+    els.equityComp = compSvg; els.equityMainBox = sec;
+    setTimeout(function () { drawEquity(st); }, 0);
+    return sec;
+  }
+  function rangePoints(st) {
+    var b = st.bankroll || {};
+    var pts = b["points_" + (ui.range === "last_24h" ? "24h" : ui.range === "last_7d" ? "7d" : "since_reset")];
+    if ((!pts || !pts.length) && b.points_since_reset) pts = b.points_since_reset;
+    return pts || [];
+  }
+  function drawEquity(st) {
+    var svg = els.equitySvg; if (!svg) return;
+    var compSvg = els.equityComp;
+    clear(svg); clear(compSvg);
+    var pts = rangePoints(st);
+    var eq = deriveEquity(pts);
+    var ns = navStats(st);
+    clear(els.equityRail);
+    [["Peak NAV", eq ? money(eq.peak, 0) : "—", ""],
+     ["Low NAV", eq ? money(eq.low, 0) : "—", ""],
+     ["Drawdown", eq ? MINUS + (eq.maxdd * 100).toFixed(1) + "%" : "—", ""],
+     ["Volatility", eq ? (eq.vol * 100).toFixed(2) + "%" : "—", ""]
+    ].forEach(function (r) {
+      els.equityRail.appendChild(h("div", { class: "rail-item" }, [
+        h("span", { class: "rail-label", text: r[0] }),
+        h("span", { class: "rail-value " + r[2], text: r[1] })
+      ]));
     });
-
-    svg.append("line").attr("class", "line-baseline")
-      .attr("x1", M.left).attr("x2", W - M.right)
-      .attr("y1", y(baseline)).attr("y2", y(baseline));
-    svg.append("text").attr("class", "annot-label")
-      .attr("x", W - M.right - 6).attr("y", y(baseline) - 6)
-      .attr("text-anchor", "end")
-      .text("RESET $" + Math.round(baseline).toLocaleString());
-
-    const area = d3.area().x((d) => x(d.ts)).y0(H - M.bottom).y1((d) => y(d.v)).curve(d3.curveMonotoneX);
-    svg.append("path").attr("class", "area-fill").attr("d", area(series));
-
-    const line = d3.line().x((d) => x(d.ts)).y((d) => y(d.v)).curve(d3.curveMonotoneX);
-    svg.append("path").attr("class", "line-equity").attr("d", line(series));
-
-    const xAxis = d3.axisBottom(x)
-      .ticks(rangeKey === "last_24h" ? 6 : 5)
-      .tickSizeOuter(0)
-      .tickFormat(rangeKey === "last_24h" ? d3.timeFormat("%H:%M") : d3.timeFormat("%-d %b"));
-    svg.append("g").attr("class", "axis")
-      .attr("transform", `translate(0,${H - M.bottom})`)
-      .call(xAxis)
-      .call((g) => g.select(".domain").remove())
-      .call((g) => g.selectAll(".tick line").remove());
-
-    const yAxis = d3.axisRight(y).ticks(5).tickSize(0)
-      .tickFormat((d) => "$" + (d / 1000).toFixed(1) + "k");
-    svg.append("g").attr("class", "axis")
-      .attr("transform", `translate(${W - M.right + 8},0)`)
-      .call(yAxis)
-      .call((g) => g.select(".domain").remove());
-
-    // Extreme markers — circle at the point, label kept inside the plot.
-    [
-      { d: high, label: "HIGH " + fmtMoney0(high.v), preferAbove: true },
-      { d: low, label: "LOW " + fmtMoney0(low.v), preferAbove: true },
-    ].forEach(({ d, label, preferAbove }) => {
-      svg.append("circle").attr("class", "marker-extreme")
-        .attr("cx", x(d.ts)).attr("cy", y(d.v)).attr("r", 3.5);
-      const labelX = Math.min(Math.max(x(d.ts), M.left + 60), W - M.right - 60);
-      // Pin label above (or below if it would clip the top).
-      let labelY = y(d.v) - 10;
-      if (labelY < M.top + 14) labelY = y(d.v) + 18;
-      svg.append("text").attr("class", "marker-label")
-        .attr("x", labelX).attr("y", labelY).attr("text-anchor", "middle").text(label);
-    });
-
-    const focus = svg.append("g").style("display", "none");
-    focus.append("line").attr("class", "crosshair-line")
-      .attr("y1", M.top).attr("y2", H - M.bottom);
-    focus.append("circle").attr("class", "crosshair-dot").attr("r", 4);
-
-    let tip = wrapEl.querySelector(".equity-tooltip");
-    if (!tip) {
-      tip = document.createElement("div");
-      tip.className = "equity-tooltip";
-      wrapEl.style.position = "relative";
-      wrapEl.appendChild(tip);
+    var overlays = els.equityPlot.querySelector("[data-overlays]"); clear(overlays);
+    var yAxis = els.equityPlot.querySelector("[data-axis-y]"); clear(yAxis);
+    var xAxis = els.equityMainBox.querySelector("[data-axis-x]"); clear(xAxis);
+    if (!pts.length) {
+      var t = s("text", { x: 400, y: 150, "text-anchor": "middle", fill: "var(--ink-faint)" });
+      t.textContent = "no bankroll points yet"; svg.appendChild(t); return;
     }
-    const bisect = d3.bisector((d) => d.ts).left;
-    svg.append("rect")
-      .attr("x", M.left).attr("y", M.top)
-      .attr("width", W - M.right - M.left).attr("height", H - M.bottom - M.top)
-      .attr("fill", "transparent")
-      .on("mouseenter", () => { focus.style("display", null); tip.classList.add("is-visible"); })
-      .on("mouseleave", () => { focus.style("display", "none"); tip.classList.remove("is-visible"); })
-      .on("mousemove", (ev) => {
-        const [mx] = d3.pointer(ev);
-        const t = x.invert(mx);
-        const i = Math.min(Math.max(bisect(series, t), 1), series.length - 1);
-        const d0 = series[i - 1], d1 = series[i];
-        const d = t - d0.ts > d1.ts - t ? d1 : d0;
-        focus.select("line").attr("x1", x(d.ts)).attr("x2", x(d.ts));
-        focus.select("circle").attr("cx", x(d.ts)).attr("cy", y(d.v));
 
-        const ts = d.ts.toLocaleString("en-GB", {
-          day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "UTC",
-        });
-        // Build via DOM to avoid any HTML interpolation ambiguity.
-        tip.replaceChildren();
-        const tt = document.createElement("span");
-        tt.className = "tt-time";
-        tt.textContent = ts + " UTC";
-        tip.appendChild(tt);
-        tip.appendChild(document.createTextNode(fmtMoney2(d.v) + "  "));
-        const pct = document.createElement("span");
-        pct.style.color = "var(--ink-dim)";
-        pct.textContent = fmtPct((d.v - baseline) / baseline, 1);
-        tip.appendChild(pct);
+    var W = 800, H = 300, padL = 6, padR = 10, padT = 14, padB = 8;
+    var xs = pts.map(function (p) { return parseTs(p.ts) || 0; });
+    var tmin = xs[0], tmax = xs[xs.length - 1] || tmin + 1;
+    var cashv = pts.map(function (p) { return p.balance_usd || 0; });
+    var navv = pts.map(function (p) { return navOf(p) || 0; });
+    var baseline = navv[0];  // opening NAV for the window
 
-        const wrapBox = wrapEl.getBoundingClientRect();
-        const svgBox = svg.node().getBoundingClientRect();
-        const ratio = svgBox.width / W;
-        tip.style.left = svgBox.left - wrapBox.left + x(d.ts) * ratio + "px";
-        tip.style.top = svgBox.top - wrapBox.top + y(d.v) * ratio + "px";
+    // Data-fitted y-domain: the NAV move fills the panel; baseline stays in frame.
+    var lo = Math.min(Math.min.apply(null, navv), baseline);
+    var hi = Math.max(Math.max.apply(null, navv), baseline);
+    var span = (hi - lo) || 1;
+    var ymin = lo - span * 0.10, ymax = hi + span * 0.08;
+    var X = function (t) { return padL + (tmax === tmin ? 0.5 : (t - tmin) / (tmax - tmin)) * (W - padL - padR); };
+    var Y = function (v) { return H - padB - (v - ymin) / (ymax - ymin) * (H - padT - padB); };
+
+    var grid = s("g", { class: "grid" });
+    for (var i = 0; i <= 3; i++) {
+      var gv = ymin + (ymax - ymin) * (i / 3);
+      var gy = Y(gv);
+      grid.appendChild(s("line", { x1: padL, x2: W - padR, y1: gy, y2: gy }));
+      if (i > 0) yAxis.appendChild(h("span", { class: "ax-y", style: "top:" + (gy / H * 100) + "%", text: moneyCompact(gv) }));
+    }
+    svg.appendChild(grid);
+
+    // Shaded gap between opening NAV and the curve — the drawdown itself.
+    var dGap = "M " + X(xs[0]).toFixed(2) + " " + Y(baseline).toFixed(2);
+    pts.forEach(function (p, i) { dGap += " L " + X(xs[i]).toFixed(2) + " " + Y(navv[i]).toFixed(2); });
+    dGap += " L " + X(xs[xs.length - 1]).toFixed(2) + " " + Y(baseline).toFixed(2) + " Z";
+    var up = eq.last >= baseline;
+    svg.appendChild(s("path", { class: "area " + (up ? "up" : "down"), d: dGap }));
+
+    var bl = s("line", { class: "baseline", x1: padL, x2: W - padR, y1: Y(baseline), y2: Y(baseline) });
+    bl.setAttribute("vector-effect", "non-scaling-stroke"); svg.appendChild(bl);
+    overlays.appendChild(h("span", { class: "eq-base-label", style: "top:" + (Y(baseline) / H * 100) + "%", text: "opening " + moneyCompact(baseline) }));
+
+    var dNav = "";
+    pts.forEach(function (p, i) { dNav += (i ? "L" : "M") + " " + X(xs[i]).toFixed(2) + " " + Y(navv[i]).toFixed(2) + " "; });
+    var nl = s("path", { class: "line nav", d: dNav }); nl.setAttribute("vector-effect", "non-scaling-stroke"); svg.appendChild(nl);
+
+    var pk = s("circle", { class: "peak", cx: X(xs[eq.peakIdx]), cy: Y(eq.peak), r: 3.2 });
+    pk.setAttribute("vector-effect", "non-scaling-stroke"); svg.appendChild(pk);
+
+    // End-of-line: latest at-cost NAV, plus a marked-to-market ring when the
+    // marked value (hero figure) diverges — so chart and hero visibly agree.
+    var lastX = X(xs[xs.length - 1]), lastY = Y(navv[navv.length - 1]);
+    overlays.appendChild(h("span", { class: "eq-end-label", style: "top:" + (lastY / H * 100) + "%", text: moneyCompact(navv[navv.length - 1]) + " at cost" }));
+    if (ns.nav != null && ymin < ns.nav && ns.nav < ymax && Math.abs(ns.nav - navv[navv.length - 1]) / Math.max(navv[navv.length - 1], 1) > 0.005) {
+      var ring = s("circle", { class: "marked-ring", cx: lastX, cy: Y(ns.nav), r: 4 });
+      ring.setAttribute("vector-effect", "non-scaling-stroke");
+      svg.appendChild(ring);
+      overlays.appendChild(h("span", { class: "eq-end-label marked", style: "top:" + (Y(ns.nav) / H * 100) + "%", text: "marked " + moneyCompact(ns.nav) }));
+    }
+
+    var cross = s("line", { class: "equity-cross", y1: padT, y2: H - padB });
+    cross.setAttribute("vector-effect", "non-scaling-stroke");
+    var cdot = s("circle", { class: "equity-cdot", r: 3.5 });
+    svg.appendChild(cross); svg.appendChild(cdot);
+
+    // ---- composition strip (0-based, honest magnitudes) ----
+    var CH = 64, cymax = Math.max.apply(null, navv) * 1.04 || 1;
+    var CY = function (v) { return CH - (v / cymax) * (CH - 4); };
+    var dCash = "M " + X(xs[0]).toFixed(2) + " " + CH;
+    pts.forEach(function (p, i) { dCash += " L " + X(xs[i]).toFixed(2) + " " + CY(cashv[i]).toFixed(2); });
+    dCash += " L " + X(xs[xs.length - 1]).toFixed(2) + " " + CH + " Z";
+    compSvg.appendChild(s("path", { class: "area cash", d: dCash }));
+    var dDep = "M " + X(xs[0]).toFixed(2) + " " + CY(navv[0]).toFixed(2);
+    pts.forEach(function (p, i) { dDep += " L " + X(xs[i]).toFixed(2) + " " + CY(navv[i]).toFixed(2); });
+    for (var j = pts.length - 1; j >= 0; j--) { dDep += " L " + X(xs[j]).toFixed(2) + " " + CY(cashv[j]).toFixed(2); }
+    dDep += " Z";
+    compSvg.appendChild(s("path", { class: "area deployed", d: dDep }));
+    var ccross = s("line", { class: "equity-cross", y1: 0, y2: CH });
+    ccross.setAttribute("vector-effect", "non-scaling-stroke");
+    compSvg.appendChild(ccross);
+
+    xAxis.appendChild(h("span", { class: "ax-x l", text: shortDate(pts[0].ts) }));
+    xAxis.appendChild(h("span", { class: "ax-x r", text: shortDate(pts[pts.length - 1].ts) }));
+
+    function onMove(ev) {
+      var rect = svg.getBoundingClientRect();
+      var fx = (ev.clientX - rect.left) / rect.width;
+      var tx = tmin + fx * (tmax - tmin);
+      var idx = 0, best = Infinity;
+      for (var i = 0; i < xs.length; i++) { var dd2 = Math.abs(xs[i] - tx); if (dd2 < best) { best = dd2; idx = i; } }
+      var px = X(xs[idx]), py = Y(navv[idx]);
+      var dep = navv[idx] - cashv[idx];
+      cross.setAttribute("x1", px); cross.setAttribute("x2", px); cross.style.opacity = 1;
+      ccross.setAttribute("x1", px); ccross.setAttribute("x2", px); ccross.style.opacity = 1;
+      cdot.setAttribute("cx", px); cdot.setAttribute("cy", py); cdot.style.opacity = 1;
+      var tip = els.equityTip;
+      clear(tip);
+      tip.appendChild(h("span", { class: sgn(navv[idx] - baseline), text: "NAV " + money(navv[idx], 0) }));
+      tip.appendChild(h("span", { class: "t-sub", text: "cash " + money(cashv[idx], 0) + " · deployed " + money(dep, 0) }));
+      tip.appendChild(h("span", { class: "t-date", text: new Date(xs[idx]).toLocaleString("en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) }));
+      tip.style.left = (px / W * 100) + "%"; tip.style.top = (py / H * 100) + "%"; tip.style.opacity = 1;
+    }
+    function onLeave() { cross.style.opacity = 0; ccross.style.opacity = 0; cdot.style.opacity = 0; els.equityTip.style.opacity = 0; }
+    svg.addEventListener("mousemove", onMove);
+    svg.addEventListener("mouseleave", onLeave);
+  }
+
+  /* ---------- II — attention & tape ---------------------------------------
+     Promoted above the deep tables: "what needs me" must not live below
+     ~4,000px of rows. Flags are severity-sorted and capped; the tape is
+     deduplicated into counted runs with an agent-state verdict. */
+  function renderActivity(st, flags) {
+    var sec = folio("II", "activity", "Attention & tape", ["What needs you, then what the agent has been doing."]);
+    var grid = h("div", { class: "activity-grid" });
+    grid.appendChild(attentionPanel(st, flags));
+    grid.appendChild(tapePanel(st));
+    sec.appendChild(grid);
+    return sec;
+  }
+  function attentionPanel(st, flags) {
+    var panel = h("div", { class: "panel" }, h("p", { class: "panel-title", text: "Attention" }));
+    (flags || []).slice(0, 4).forEach(function (f) {
+      panel.appendChild(h("div", { class: "flag " + f.sev }, [
+        h("span", { class: "flag-ico", text: f.ico }),
+        h("div", { class: "flag-body" }, [h("div", { class: "flag-head", text: f.head }), h("div", { class: "flag-note", text: f.note })])
+      ]));
+    });
+    panel.appendChild(settlementsWeek(st));
+    return panel;
+  }
+  function settlementsWeek(st) {
+    var sm = st.settlements || {};
+    var buckets = sm.buckets_7d || [];
+    var wrap = h("div", { style: "margin-top:1.1rem" });
+    var paid = (sm.totals_24h && sm.totals_24h.paid_usd) || 0;
+    wrap.appendChild(h("p", { class: "panel-title", style: "margin-top:.4rem" }, [
+      "Settlements · 7 days",
+      h("span", { class: "dim", style: "text-transform:none;letter-spacing:0;float:right", text: "24h paid " + money(paid, 0) })
+    ]));
+    if (!buckets.length) { wrap.appendChild(h("p", { class: "folio-empty", text: "no settlements yet" })); return wrap; }
+    var maxN = Math.max.apply(null, buckets.map(function (b) { return (b.wins || 0) + (b.losses || 0); }).concat([1]));
+    var week = h("div", { class: "settle-week" });
+    buckets.forEach(function (b) {
+      var stack = h("div", { class: "settle-stack" });
+      if (b.wins) stack.appendChild(h("div", { class: "settle-bar win", style: "height:" + (b.wins / maxN * 100) + "%", title: b.wins + " wins" }));
+      if (b.losses) stack.appendChild(h("div", { class: "settle-bar loss", style: "height:" + (b.losses / maxN * 100) + "%", title: b.losses + " losses" }));
+      week.appendChild(h("div", { class: "settle-day" }, [stack, h("div", { class: "settle-d", text: (b.date || "").slice(8) })]));
+    });
+    wrap.appendChild(week);
+    return wrap;
+  }
+  function tapeReason(e) {
+    var sum = String(e.summary || "");
+    var cut = sum.indexOf("::");
+    var r = (cut >= 0 ? sum.slice(0, cut) : sum).trim();
+    return r || (e.kind || "event");
+  }
+  function tapePanel(st) {
+    var panel = h("div", { class: "panel" }, h("p", { class: "panel-title", text: "Recent tape" }));
+    var ev = (st.decisions || {}).events || [];
+    if (!ev.length) { panel.appendChild(h("p", { class: "folio-empty", text: "no decisions yet" })); return panel; }
+
+    var isAction = function (e) {
+      var k = (e.kind || "").toLowerCase();
+      return k.indexOf("refus") < 0 && (k.indexOf("fill") >= 0 || k.indexOf("order") >= 0 || k.indexOf("intent") >= 0 || k.indexOf("settle") >= 0);
+    };
+    // Verdict line: when the whole window is refusals, say the one true thing.
+    if (!ev.some(isAction)) {
+      var counts = {};
+      ev.forEach(function (e) { var r = tapeReason(e); counts[r] = (counts[r] || 0) + 1; });
+      var top = Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; })[0];
+      panel.appendChild(h("p", { class: "tape-verdict" }, [
+        h("b", { text: "0 trades in this window" }),
+        document.createTextNode(" — every signal hit a gate · top: "),
+        h("span", { class: "num", text: top + " ×" + counts[top] })
+      ]));
+    }
+
+    // Dedupe consecutive same-strategy/same-reason events into counted runs.
+    var runs = [];
+    ev.forEach(function (e) {
+      var key = (e.strategy || "—") + "|" + tapeReason(e) + "|" + (e.kind || "");
+      var last = runs[runs.length - 1];
+      if (last && last.key === key) { last.count++; last.t1 = e.ts; return; }
+      runs.push({ key: key, strategy: e.strategy || "—", reason: tapeReason(e), kind: (e.kind || "").toLowerCase(), count: 1, t0: e.ts, t1: e.ts, action: isAction(e) });
+    });
+    runs.sort(function (a, b) { return (b.action ? 1 : 0) - (a.action ? 1 : 0); });  // real actions first
+
+    var ul = h("ul", { class: "tape" });
+    runs.slice(0, 10).forEach(function (r) {
+      var tag = r.kind.indexOf("refus") >= 0 ? ["refused", "refused"] :
+        r.kind.indexOf("intent") >= 0 ? ["intent", "intent"] :
+        r.kind.indexOf("fill") >= 0 || r.kind.indexOf("order") >= 0 ? ["buy", "fill"] :
+        r.kind.indexOf("settle") >= 0 ? ["settle", "settled"] : ["intent", r.kind || "event"];
+      var when = r.count > 1 && clockTime(r.t1) !== clockTime(r.t0)
+        ? clockTime(r.t1) + "–" + clockTime(r.t0) : clockTime(r.t0);
+      ul.appendChild(h("li", {}, [
+        h("span", { class: "tape-time", text: when }),
+        h("span", { class: "tape-what" }, [
+          h("span", { class: "strat", text: r.strategy + " " }),
+          h("span", { class: "dim", text: r.reason }),
+          r.count > 1 ? h("span", { class: "tape-mult", text: "×" + r.count }) : null
+        ]),
+        h("span", { class: "tape-tag " + tag[0], text: tag[1] })
+      ]));
+    });
+    panel.appendChild(ul);
+    return panel;
+  }
+
+  /* ---------- III — strategy ledger ---------------------------------------
+     The dominant graphic now encodes SKILL (signed ROI, clamped) — the deck
+     promised "ranked by skill, not size" and the bar must agree. Dormant
+     strategies collapse to one expandable line. Red is reserved for the
+     worst bleeders and group subtotals; the earning minority gets green. */
+  var ROI_CLAMP = 1.5;  // ±150% — beyond this the bar saturates (tiny-deploy outliers)
+  var LEDGER_COLS = [
+    { key: "name", label: "Strategy", cls: "t-name" },
+    { key: "pl", label: "P/L" }, { key: "roi", label: "ROI" },
+    { key: "win", label: "Win" }, { key: "wl", label: "W–L" },
+    { key: "resolved", label: "Closed" }, { key: "deployed", label: "Deployed" },
+    { key: "bar", label: "ROI, diverging", cls: "contrib-cell" }
+  ];
+  function ledgerVal(s2, key) {
+    switch (key) {
+      case "name": return s2.name; case "pl": return s2.realised; case "roi": return s2.roi;
+      case "win": return s2.win_rate; case "wl": return s2.closed_count; case "resolved": return s2.closed_count;
+      case "deployed": return s2.deployed; case "bar": return s2.roi;
+    }
+  }
+  function renderLedger(st) {
+    var strat = prepStrategies((st.strategies || {}).strategies);
+    var profitable = strat.filter(function (s2) { return s2.group === "earning"; }).length;
+    var sec = folio("III", "strategies", "Strategy ledger",
+      ["Ranked by skill — the bar is ROI (realised P/L over capital deployed), diverging from zero. Grouped by whether they earn, bleed, or sit dormant."],
+      h("span", { class: "folio-meta", text: profitable + " of " + strat.length + " in profit" }));
+    var box = h("div", { class: "ledger-scroll" });
+    els.ledgerBox = box;
+    sec.appendChild(box);
+    buildLedger(strat);
+    return sec;
+  }
+  function buildLedger(strat) {
+    var box = els.ledgerBox; clear(box);
+    if (!strat.length) { box.appendChild(h("p", { class: "folio-empty", text: "no strategies have traded yet" })); return; }
+    // Saturated red is reserved for the two worst bleeders.
+    var worstSet = {};
+    strat.filter(function (s2) { return s2.group === "bleeding"; })
+      .sort(function (a, b) { return a.realised - b.realised; })
+      .slice(0, 2).forEach(function (s2) { worstSet[s2.name] = 1; });
+
+    var table = h("table", { class: "ledger-table" });
+    var thr = h("tr");
+    LEDGER_COLS.forEach(function (c) {
+      var sorted = ui.ledgerSort.key === c.key;
+      thr.appendChild(h("th", {
+        class: (c.cls || "") + (sorted ? " is-sort" : ""),
+        "aria-sort": sorted ? (ui.ledgerSort.dir < 0 ? "descending" : "ascending") : "none",
+        onclick: (function (key) { return function () { sortLedger(key); }; })(c.key)
+      }, [c.label, h("span", { class: "arrow", text: sorted ? (ui.ledgerSort.dir < 0 ? "↓" : "↑") : "↕" })]));
+    });
+    table.appendChild(h("thead", {}, thr));
+
+    [["earning", "Earning"], ["bleeding", "Bleeding"]].forEach(function (g) {
+      var rows = strat.filter(function (s2) { return s2.group === g[0]; });
+      if (!rows.length) return;
+      rows.sort(function (a, b) { return cmpVal(ledgerVal(a, ui.ledgerSort.key), ledgerVal(b, ui.ledgerSort.key)) * ui.ledgerSort.dir; });
+      var groupSum = rows.reduce(function (a, s2) { return a + s2.realised; }, 0);
+      var tb = h("tbody");
+      tb.appendChild(h("tr", { class: "lg-row" }, h("td", { colspan: LEDGER_COLS.length }, h("div", { class: "ledger-group-head" }, [
+        h("span", { class: "ledger-group-name " + g[0], text: g[1] }),
+        h("span", { class: "ledger-group-count", text: rows.length }),
+        h("span", { class: "ledger-group-sum " + sgn(groupSum), text: moneySigned(groupSum, 0) })
+      ]))));
+      rows.forEach(function (s2) { tb.appendChild(ledgerRow(s2, worstSet)); });
+      table.appendChild(tb);
+    });
+
+    // Dormant: one expandable summary line instead of 8 rows of dashes.
+    var dorm = strat.filter(function (s2) { return s2.group === "dormant"; });
+    if (dorm.length) {
+      var holding = dorm.filter(function (s2) { return s2.deployed > 0; });
+      var dormDeployed = dorm.reduce(function (a, s2) { return a + s2.deployed; }, 0);
+      var tb2 = h("tbody");
+      tb2.appendChild(h("tr", { class: "lg-row dormant-toggle", onclick: function () { ui.dormantOpen = !ui.dormantOpen; buildLedger(prepStrategies((state.strategies || {}).strategies)); } },
+        h("td", { colspan: LEDGER_COLS.length }, h("div", { class: "ledger-group-head" }, [
+          h("span", { class: "dorm-chev" + (ui.dormantOpen ? " open" : ""), text: "▸" }),
+          h("span", { class: "ledger-group-name dormant", text: "Dormant" }),
+          h("span", { class: "ledger-group-count", text: dorm.length + " strategies · nothing realised" }),
+          h("span", { class: "ledger-group-sum dim", text: holding.length + " holding " + moneyCompact(dormDeployed) + " unresolved · " + (dorm.length - holding.length) + " idle" })
+        ]))));
+      if (ui.dormantOpen) {
+        dorm.sort(function (a, b) { return b.deployed - a.deployed; });
+        dorm.forEach(function (s2) { tb2.appendChild(ledgerRow(s2, {})); });
+      }
+      table.appendChild(tb2);
+    }
+    box.appendChild(table);
+  }
+  function ledgerRow(s2, worstSet) {
+    var nameCell = h("td", { class: "ledger-name" }, [s2.name, s2.is_llm_strategy ? h("span", { class: "tag", text: "LLM" }) : null]);
+    var winCell = h("td", {}, s2.win_rate == null ? "—" : h("span", { class: "win-cell" }, [
+      h("span", { text: pctFrac(s2.win_rate, 0) }),
+      h("span", { class: "win-track" }, h("span", { class: "win-fill", style: "width:" + (s2.win_rate * 100) + "%" }))
+    ]));
+    // ROI diverging bar, clamped so tiny-deploy outliers can't dominate;
+    // bars on thin capital render dimmer (a −1756% ROI on $13 is noise).
+    var roiC = s2.roi == null ? 0 : Math.max(-ROI_CLAMP, Math.min(ROI_CLAMP, s2.roi));
+    var w = Math.abs(roiC) / ROI_CLAMP * 50;
+    var thin = s2.deployed < 20;
+    var bar = h("td", { class: "contrib-cell" }, h("div", { class: "contrib" }, [
+      h("div", { class: "contrib-mid" }),
+      s2.roi != null ? h("div", { class: "contrib-bar " + (s2.roi >= 0 ? "pos" : "neg") + (thin ? " thin" : ""), style: "width:" + w + "%", title: "ROI " + pctFrac(s2.roi, 0) + (thin ? " on only " + moneyCompact(s2.deployed) + " deployed" : "") }) : null
+    ]));
+    // Color policy: earning rows green; only the worst bleeders saturated red;
+    // every other negative stays neutral ink (the sign carries direction).
+    var tone = s2.group === "earning" ? "pos" : (worstSet[s2.name] ? "neg" : "");
+    return h("tr", { class: "ledger-row" }, [
+      nameCell,
+      h("td", {}, h("span", { class: tone, text: moneySigned(s2.realised, 0) })),
+      h("td", {}, h("span", { class: tone, text: s2.roi == null ? "—" : pctFrac(s2.roi, 0) })),
+      winCell,
+      h("td", { class: "dim", text: s2.wins + "–" + s2.losses }),
+      h("td", { class: "dim", text: intc(s2.closed_count) }),
+      h("td", { text: moneyCompact(s2.deployed) }),
+      bar
+    ]);
+  }
+  function sortLedger(key) {
+    if (ui.ledgerSort.key === key) ui.ledgerSort.dir *= -1;
+    else ui.ledgerSort = { key: key, dir: key === "name" ? 1 : -1 };
+    buildLedger(prepStrategies((state.strategies || {}).strategies));
+  }
+
+  /* ---------- IV — open book ----------------------------------------------
+     Grouped by theme so correlated bets read as the single thesis they are,
+     with per-cluster subtotals, a concentration strip, sparklines from the
+     payload, and expired positions parked under "awaiting settlement". */
+  var BOOK_COLS = [
+    { key: "market", label: "Position", cls: "t-market" },
+    { key: "spark", label: "Trend", nosort: true },
+    { key: "entry", label: "Entry" }, { key: "mark", label: "Mark" },
+    { key: "cost", label: "Cost" }, { key: "unrealised", label: "Unrealised" },
+    { key: "hrs", label: "Resolves" }
+  ];
+  function bookVal(it, key) {
+    switch (key) {
+      case "market": return (it.question || "").toLowerCase(); case "entry": return it.avg_entry_price;
+      case "mark": return it.mark_price; case "cost": return it.cost_basis_usd;
+      case "unrealised": return it.unrealised_pnl_usd; case "hrs": return it.hours_to_resolution;
+    }
+  }
+  function renderBook(st) {
+    var ob = st.open_book || {};
+    var items = ob.items || [];
+    var net = items.reduce(function (a, it) { return a + (it.unrealised_pnl_usd || 0); }, 0);
+    var sec = folio("IV", "book", "Open book",
+      ["Grouped by theme — correlated bets are one thesis, not diversification. ", h("span", { class: "book-paired", text: "paired" }), " marks both sides of one market held."],
+      h("span", { class: "folio-meta" }, ["net unrealised ", h("span", { class: "num " + exc(net), text: moneySigned(net, 0) })]));
+    var conc = h("div", { class: "concentration" });
+    els.bookConc = conc; sec.appendChild(conc);
+    var box = h("div", { class: "book-scroll" });
+    els.bookBox = box; sec.appendChild(box);
+    buildBook(items);
+    return sec;
+  }
+  function bookOpenDefault(c) {
+    if (c.settling) return false;
+    return Math.abs(c.unreal) >= 25 || c.cost >= 300;
+  }
+  function buildBook(items) {
+    var box = els.bookBox; clear(box);
+    var conc = els.bookConc; clear(conc);
+    if (!items.length) { box.appendChild(h("p", { class: "folio-empty", text: "no open positions" })); return; }
+    var paired = pairedConditions(items);
+    var clusters = clusterBook(items);
+    if (ui.bookOpen == null) {
+      ui.bookOpen = {};
+      clusters.forEach(function (c) { ui.bookOpen[c.name] = bookOpenDefault(c); });
+    }
+
+    // Concentration strip: cost share by theme (live clusters only).
+    var live = clusters.filter(function (c) { return !c.settling; });
+    var costAll = live.reduce(function (a, c) { return a + c.cost; }, 0);
+    if (live.length > 1 && costAll > 0) {
+      var palette = ["var(--amber)", "var(--gold)", "var(--cash)", "var(--ink-faint)"];
+      var bar = h("div", { class: "conc-bar" });
+      var keys = h("div", { class: "conc-keys" });
+      live.slice(0, 4).forEach(function (c, i) {
+        var share = c.cost / costAll;
+        bar.appendChild(h("div", { class: "conc-seg", style: "width:" + (share * 100) + "%; background:" + palette[i % palette.length] }));
+        keys.appendChild(h("span", { class: "k" }, [
+          h("span", { class: "sw", style: "background:" + palette[i % palette.length] }),
+          document.createTextNode(c.name + " "),
+          h("span", { class: "num dim", text: Math.round(share * 100) + "%" })
+        ]));
       });
+      var rest = live.slice(4).reduce(function (a, c) { return a + c.cost; }, 0);
+      if (rest > 0) bar.appendChild(h("div", { class: "conc-seg", style: "width:" + (rest / costAll * 100) + "%; background:var(--panel-2)" }));
+      conc.appendChild(h("div", { class: "recon-label", text: "Deployed capital by theme" }));
+      conc.appendChild(bar); conc.appendChild(keys);
+    }
+
+    var table = h("table", { class: "book-table" });
+    var thr = h("tr");
+    BOOK_COLS.forEach(function (c) {
+      if (c.nosort) { thr.appendChild(h("th", { class: c.cls || "", text: c.label })); return; }
+      var iss = ui.bookSort.key === c.key;
+      thr.appendChild(h("th", {
+        class: (c.cls || "") + (iss ? " is-sort" : ""),
+        "aria-sort": iss ? (ui.bookSort.dir < 0 ? "descending" : "ascending") : "none",
+        onclick: (function (key) { return function () { sortBook(key); }; })(c.key)
+      }, [c.label, h("span", { class: "arrow", text: iss ? (ui.bookSort.dir < 0 ? "↓" : "↑") : "↕" })]));
+    });
+    table.appendChild(h("thead", {}, thr));
+
+    clusters.forEach(function (c) {
+      var open = !!ui.bookOpen[c.name];
+      var tb = h("tbody");
+      tb.appendChild(h("tr", { class: "lg-row cluster-toggle", onclick: (function (name) { return function () { ui.bookOpen[name] = !ui.bookOpen[name]; buildBook((state.open_book || {}).items || []); }; })(c.name) },
+        h("td", { colspan: BOOK_COLS.length }, h("div", { class: "ledger-group-head" }, [
+          h("span", { class: "dorm-chev" + (open ? " open" : ""), text: "▸" }),
+          h("span", { class: "ledger-group-name " + (c.settling ? "dormant" : ""), text: c.name }),
+          h("span", { class: "ledger-group-count", text: c.items.length + (c.items.length === 1 ? " position" : " positions") + " · " + moneyCompact(c.cost) + " at cost" }),
+          h("span", { class: "ledger-group-sum " + exc(c.unreal), text: moneySigned(c.unreal, 0) })
+        ]))));
+      if (open) {
+        var rows = c.items.slice().sort(function (a, b) { return cmpVal(bookVal(a, ui.bookSort.key), bookVal(b, ui.bookSort.key)) * ui.bookSort.dir; });
+        rows.forEach(function (it) { tb.appendChild(bookRow(it, paired)); });
+      }
+      table.appendChild(tb);
+    });
+    box.appendChild(table);
+  }
+  function sparkCell(it) {
+    var pts = it.sparkline || [];
+    if (pts.length < 2) return h("td", { class: "spark-cell faint", text: "—" });
+    var W = 64, H = 20, pad = 2;
+    var vals = pts.map(function (p) { return p.price; });
+    var lo = Math.min.apply(null, vals.concat([it.avg_entry_price != null ? it.avg_entry_price : Infinity]));
+    var hi = Math.max.apply(null, vals.concat([it.avg_entry_price != null ? it.avg_entry_price : -Infinity]));
+    var span = (hi - lo) || 1;
+    var X = function (i) { return pad + i / (pts.length - 1) * (W - pad * 2); };
+    var Y = function (v) { return H - pad - (v - lo) / span * (H - pad * 2); };
+    var svg = s("svg", { class: "spark", viewBox: "0 0 " + W + " " + H, width: W, height: H });
+    if (it.avg_entry_price != null) {
+      svg.appendChild(s("line", { class: "spark-entry", x1: pad, x2: W - pad, y1: Y(it.avg_entry_price), y2: Y(it.avg_entry_price) }));
+    }
+    var d = "";
+    pts.forEach(function (p, i) { d += (i ? "L" : "M") + X(i).toFixed(1) + " " + Y(p.price).toFixed(1) + " "; });
+    svg.appendChild(s("path", { class: "spark-line", d: d }));
+    svg.appendChild(s("circle", { class: "spark-end " + (sgn(it.unrealised_pnl_usd) || "flat"), cx: X(pts.length - 1), cy: Y(vals[vals.length - 1]), r: 2 }));
+    return h("td", { class: "spark-cell" }, svg);
+  }
+  function bookRow(it, paired) {
+    var upct = (it.unrealised_pnl_usd != null && it.cost_basis_usd) ? it.unrealised_pnl_usd / it.cost_basis_usd : null;
+    var oc = (it.outcome_name || "").toUpperCase();
+    return h("tr", { class: "book-row" }, [
+      h("td", { class: "book-mkt" }, [
+        h("span", { class: "book-q", text: it.question || it.market_id }),
+        h("span", { class: "book-sub" }, [
+          h("span", { class: "outcome " + (oc === "YES" ? "yes" : oc === "NO" ? "no" : ""), text: it.outcome_name || it.side || "" }),
+          paired[it.condition_id] ? h("span", { class: "book-paired", text: "paired" }) : null
+        ])
+      ]),
+      sparkCell(it),
+      h("td", { text: it.avg_entry_price != null ? it.avg_entry_price.toFixed(3) : "—" }),
+      h("td", { text: it.mark_price != null ? it.mark_price.toFixed(3) : "—" }),
+      h("td", { text: moneyCompact(it.cost_basis_usd) }),
+      // Neutral ink for routine moves; saturated only when the move is material.
+      h("td", {}, it.unrealised_pnl_usd == null ? "—" : h("span", { class: exc(it.unrealised_pnl_usd) }, [
+        moneySigned(it.unrealised_pnl_usd, 0),
+        upct != null ? h("small", { class: "dim", text: " " + pctSigned(upct * 100, 0) }) : null
+      ])),
+      h("td", { class: "dim", text: resolves(it.hours_to_resolution) })
+    ]);
+  }
+  function sortBook(key) {
+    if (ui.bookSort.key === key) ui.bookSort.dir *= -1;
+    else ui.bookSort = { key: key, dir: key === "market" ? 1 : -1 };
+    buildBook((state.open_book || {}).items || []);
   }
 
-  function bindRangeControls() {
-    document.querySelectorAll("[data-range]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        document.querySelectorAll("[data-range]").forEach((b) => b.classList.remove("is-active"));
-        btn.classList.add("is-active");
-        renderEquity(btn.dataset.range);
+  /* ---------- V — reference (collapsible) -------------------------------- */
+  function renderReference(st) {
+    var det = h("details", { class: "folio reveal reference", id: "reference" });
+    det.appendChild(h("summary", {}, [
+      h("div", { class: "folio-num", text: "V" }),
+      h("div", { class: "folio-titles" }, [
+        h("h2", { class: "folio-title", text: "Reference & diagnostics" }),
+        h("p", { class: "folio-deck", text: "Watchlist and LLM spend — open when you need the detail." })
+      ]),
+      h("span", { class: "chev", text: "▸" })
+    ]));
+    var grid = h("div", { class: "ref-grid" });
+
+    var wl = (st.watchlist || {}).items || [];
+    var wblock = h("div", { class: "ref-block" });
+    wblock.appendChild(h("div", { class: "ref-h" }, [
+      h("span", { text: "Watchlist" }),
+      h("input", { class: "watch-filter", type: "search", placeholder: "filter market / gate…", value: ui.watch, oninput: function (e) { ui.watch = e.target.value; buildWatch(wl); } })
+    ]));
+    var wbox = h("div"); els.watchBox = wbox; wblock.appendChild(wbox); buildWatch(wl);
+    grid.appendChild(wblock);
+
+    var llm = (st.llm_activity || {}).strategies || [];
+    var lblock = h("div", { class: "ref-block" });
+    lblock.appendChild(h("div", { class: "ref-h" }, [h("span", { text: "LLM activity · 24h" }),
+      h("span", { class: "dim", text: intc((st.llm_activity || {}).total_calls) + " calls" })]));
+    if (!llm.length) lblock.appendChild(h("p", { class: "folio-empty", text: "no LLM activity in the last 24h" }));
+    else {
+      lblock.appendChild(h("table", { class: "mini-table" }, [
+        h("thead", {}, h("tr", {}, [th("Strategy", "l"), th("Calls"), th("Intents"), th("Conv"), th("$/call")])),
+        h("tbody", {}, llm.map(function (r) {
+          return h("tr", {}, [
+            h("td", { class: "l", text: r.name }),
+            h("td", { text: intc(r.calls) }), h("td", { text: intc(r.intents) }),
+            h("td", { text: r.conversion == null ? "—" : pctFrac(r.conversion, 1) }),
+            h("td", { text: r.token_cost_usd == null ? "—" : money(r.token_cost_usd, 3) })
+          ]);
+        }))
+      ]));
+    }
+    grid.appendChild(lblock);
+    det.appendChild(grid);
+    return det;
+  }
+  function th(label, cls) { return h("th", { class: cls || "", text: label }); }
+  function buildWatch(items) {
+    var box = els.watchBox; clear(box);
+    var q = ui.watch.trim().toLowerCase();
+    var rows = items.filter(function (it) {
+      if (!q) return true;
+      return (it.question || "").toLowerCase().indexOf(q) >= 0 ||
+        (it.passed_strategies || []).join(" ").toLowerCase().indexOf(q) >= 0;
+    });
+    if (!rows.length) { box.appendChild(h("p", { class: "folio-empty", text: q ? "no matches" : "no markets observed today" })); return; }
+    box.appendChild(h("table", { class: "mini-table" }, [
+      h("thead", {}, h("tr", {}, [th("Market", "l"), th("Yes"), th("Spread"), th("Gates", "l")])),
+      h("tbody", {}, rows.slice(0, 40).map(function (it) {
+        return h("tr", {}, [
+          h("td", { class: "l", title: it.question, text: it.question || it.market_id }),
+          h("td", { text: it.yes_mid == null ? "—" : Number(it.yes_mid).toFixed(3) }),
+          h("td", { text: it.spread == null ? "—" : Number(it.spread).toFixed(3) }),
+          h("td", { class: "l" }, (it.passed_strategies || []).length
+            ? it.passed_strategies.map(function (g) { return h("span", { class: "gate", text: g }); })
+            : h("span", { class: "faint", text: "—" }))
+        ]);
+      }))
+    ]));
+  }
+
+  /* ---------- shared sort comparator ------------------------------------ */
+  function cmpVal(a, b) {
+    if (a == null && b == null) return 0;
+    if (a == null) return 1; if (b == null) return -1;   // nulls last
+    if (typeof a === "string" || typeof b === "string") return String(a) < String(b) ? -1 : String(a) > String(b) ? 1 : 0;
+    return a < b ? -1 : a > b ? 1 : 0;
+  }
+
+  /* ---------- segmented control ------------------------------------------
+     opts: [value, label, disabled?]. Disabled pills render but can't be
+     picked — used when a range genuinely has no data. */
+  function seg(opts, active, onpick) {
+    return h("div", { class: "seg" }, opts.map(function (o) {
+      return h("button", {
+        type: "button",
+        class: (o[0] === active ? "is-active" : "") + (o[2] ? " is-disabled" : ""),
+        disabled: o[2] ? "disabled" : null,
+        title: o[2] ? "no data for this range in the current snapshot" : null,
+        onclick: o[2] ? null : function (ev) {
+          var box = ev.currentTarget.closest(".seg");
+          if (box) box.querySelectorAll("button").forEach(function (bn) { bn.classList.remove("is-active"); });
+          ev.currentTarget.classList.add("is-active");
+          onpick(o[0]);
+        }, text: o[1]
       });
-    });
+    }));
   }
 
-  /* ─────────────────────  II — STRATEGIES  ───────────────────── */
-  const ROMAN_NUMS = ["I","II","III","IV","V","VI","VII","VIII","IX","X"];
-  const romanize = (i) => ROMAN_NUMS[i - 1] || "·";
-  function computeWilson(wins, n) {
-    if (n === 0) return 0;
-    const z = 1.96;
-    const p = wins / n;
-    return (p + (z * z) / (2 * n) - z * Math.sqrt((p * (1 - p) + (z * z) / (4 * n)) / n)) /
-      (1 + (z * z) / n);
+  /* ---------- theme ------------------------------------------------------ */
+  function toggleTheme() {
+    var cur = document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
+    var next = cur === "light" ? "dark" : "light";
+    document.documentElement.setAttribute("data-theme", next);
+    try { localStorage.setItem("pmdash-theme", next); } catch (e) {}
+    var btn = document.querySelector("[data-theme-toggle]");
+    if (btn) {
+      btn.querySelector(".ico").textContent = next === "light" ? "☾" : "☀";
+      btn.querySelector(".lbl").textContent = next === "light" ? "Night" : "Morning";
+    }
   }
-  function renderConfidence(on) {
-    let html = "";
-    for (let i = 0; i < 5; i++)
-      html += '<span class="strat-confidence-dot' + (i < on ? " is-on" : "") + '"></span>';
-    return html;
-  }
-  function statCell(label, value, sub) {
-    return (
-      '<div><span class="strat-stat-label">' + esc(label) + "</span>" +
-      '<span class="strat-stat-value">' + value +
-      (sub ? '<small>' + esc(sub) + "</small>" : "") +
-      "</span></div>"
-    );
-  }
-  function renderStrategies() {
-    const strats = data.strategies.slice();
-    const active = strats.filter((s) => s.pl !== 0);
-    const holding = strats.filter((s) => s.pl === 0 && s.open > 0);
-    const dormant = strats.filter((s) => s.pl === 0 && s.open === 0);
 
-    active.sort((a, b) => Math.abs(b.pl) - Math.abs(a.pl));
-
-    const totalLoss = active.reduce((a, b) => a + Math.abs(b.pl), 0);
-    document.querySelector("[data-strat-meta]").textContent =
-      "Realised " + fmtSigned(-totalLoss, 0) + " across " + active.length +
-      " active strategies";
-    const bar = document.querySelector("[data-strat-impact-bar]");
-    const legend = document.querySelector("[data-strat-impact-legend]");
-    bar.replaceChildren();
-    legend.replaceChildren();
-    // Palette is derived so it tracks the theme.
-    const oxbloodC = readVar("--oxblood", "#c25c52");
-    const brassC = readVar("--brass", "#d2a25c");
-    const brassDeepC = readVar("--brass-deep", "#8a6f3e");
-    const palette = [oxbloodC, brassC, brassDeepC, readVar("--iron", "#5e574e"), readVar("--ink-faint", "#463d31")];
-    active.forEach((s, i) => {
-      const w = (Math.abs(s.pl) / totalLoss) * 100;
-      const div = document.createElement("div");
-      div.style.width = w + "%";
-      div.style.background = palette[i % palette.length];
-      div.title = s.name + " · " + fmtMoney0(s.pl) + " · " + w.toFixed(0) + "%";
-      bar.appendChild(div);
-
-      const chip = document.createElement("span");
-      chip.className = "legend-chip";
-      const sw = document.createElement("span");
-      sw.className = "legend-swatch";
-      sw.style.background = palette[i % palette.length];
-      chip.appendChild(sw);
-      chip.appendChild(document.createTextNode(s.name + "  " + w.toFixed(0) + "%"));
-      legend.appendChild(chip);
-    });
-
-    const grid = document.querySelector("[data-strat-grid]");
-    grid.replaceChildren();
-    const allCards = [...active, ...holding];
-    allCards.forEach((s, i) => {
-      const isHolding = s.pl === 0 && s.open > 0;
-      const tone = s.pl < 0 ? "loss" : s.pl > 0 ? "gain" : "flat";
-      const sample = (s.wins || 0) + (s.losses || 0);
-      const winLabel = sample === 0 ? "—" : Math.round((s.win_rate || 0) * 100) + "%";
-      const winSub = sample === 0 ? "no sample" : "n=" + sample;
-      const dotsOn = sample === 0 ? 0 : Math.min(5, Math.floor(Math.log2(sample) - 1));
-
-      const card = document.createElement("article");
-      card.className = "strat-card" + (isHolding ? " holding" : "");
-      const sharePct = totalLoss > 0 && s.pl < 0 ? (Math.abs(s.pl) / totalLoss) * 100 : 0;
-      const ipk = s.intents_per_1000 ?? 0;
-
-      // Each piece of dynamic content is escaped; structural HTML is static.
-      card.innerHTML =
-        '<div class="strat-rank">' + esc(romanize(i + 1)) + "</div>" +
-        '<div class="strat-name-row">' +
-        '<span class="strat-name">' + esc(s.name) + "</span>" +
-        (s.llm ? '<span class="strat-flag">LLM</span>' : "") +
-        (isHolding ? '<span class="strat-flag holding">Holding</span>' : "") +
-        "</div>" +
-        '<div class="strat-pl ' + tone + '">' +
-        esc(s.pl === 0 ? "+0.00" : fmtSigned(s.pl)) +
-        "</div>" +
-        (s.pl < 0
-          ? '<div class="strat-share-row">' +
-            '<div class="strat-share-track"><div class="strat-share-fill" style="width:' +
-            sharePct.toFixed(1) + '%"></div></div>' +
-            '<div class="strat-share-meta"><span>Share of loss</span><strong>' +
-            esc(sharePct.toFixed(0)) + "%</strong></div>" +
-            "</div>"
-          : "") +
-        '<dl class="strat-grid-stats">' +
-        statCell("Open", esc(s.open)) +
-        statCell("Deployed", esc("$" + fmtCount(s.deployed))) +
-        statCell(
-          "Win rate",
-          '<span class="strat-confidence">' + esc(winLabel) + renderConfidence(dotsOn) + "</span>",
-          winSub
-        ) +
-        statCell(
-          "Intents / 1k",
-          esc(ipk.toFixed(1)),
-          esc(s.intents + " / " + s.evals)
-        ) +
-        statCell("Conv.", sample > 0 ? esc(Math.round((s.win_rate || 0) * 100) + "%") : "—") +
-        statCell(
-          s.llm ? "$/call" : "Status",
-          s.llm
-            ? esc(s.usd_per_call != null ? fmtSigned(s.usd_per_call, 4) : "—")
-            : isHolding
-            ? "Holding"
-            : "Active"
-        ) +
-        "</dl>";
-      grid.appendChild(card);
-    });
-
-    const dormantEl = document.querySelector("[data-strat-dormant]");
-    if (dormant.length === 0) {
-      dormantEl.style.display = "none";
+  /* ---------- full render ------------------------------------------------ */
+  function render(st, animate) {
+    state = st; window.__st = st;
+    var scrollY = window.scrollY;
+    var flags = computeFlags(st);
+    var frag = document.createDocumentFragment();
+    frag.appendChild(renderStatusbar(st, flags));
+    var wrap = h("div", { class: "wrap" });
+    wrap.appendChild(renderStandings(st));
+    wrap.appendChild(renderEquity(st));
+    wrap.appendChild(renderActivity(st, flags));   // attention before the deep tables
+    wrap.appendChild(renderLedger(st));
+    wrap.appendChild(renderBook(st));
+    wrap.appendChild(renderReference(st));
+    frag.appendChild(wrap);
+    clear(app);
+    app.appendChild(frag);
+    if (!animate) {
+      app.querySelectorAll(".reveal").forEach(function (el) { el.style.animation = "none"; el.style.opacity = 1; el.style.transform = "none"; });
+      window.scrollTo(0, scrollY);
     } else {
-      dormantEl.replaceChildren();
-      const head = document.createElement("div");
-      head.className = "strat-dormant-head";
-      head.textContent = "Dormant — no positions, no realised P/L";
-      const list = document.createElement("div");
-      list.className = "strat-dormant-list";
-      dormant.forEach((s) => {
-        const span = document.createElement("span");
-        span.textContent = s.name;
-        list.appendChild(span);
-      });
-      dormantEl.appendChild(head);
-      dormantEl.appendChild(list);
+      app.querySelectorAll(".reveal").forEach(function (el, i) { el.style.animationDelay = (i * 70) + "ms"; });
     }
+    detectBanner();
+    tickAge();
+  }
+  function detectBanner() {
+    var b = document.querySelector(".snapshot-banner");
+    document.documentElement.style.setProperty("--snap-banner-h", b ? b.offsetHeight + "px" : "0px");
+  }
+  function tickAge() {
+    if (els.age && state) els.age.textContent = relAge(ageMs(latestDataIso(state)));
   }
 
-  /* ─────────────────────  III — OPEN BOOK  ───────────────────── */
-  function renderBook() {
-    const sortState = { key: "unrealised", dir: "desc" };
-    const counts = {};
-    data.open_book.forEach((r) => (counts[r.market] = (counts[r.market] || 0) + 1));
+  /* ---------- liveness --------------------------------------------------- */
+  function startPolling() {
+    if (ageTimer) clearInterval(ageTimer);
+    ageTimer = setInterval(tickAge, 30000);
+    schedulePoll(60000);
+  }
+  function schedulePoll(ms) {
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = setTimeout(poll, ms);
+  }
+  function poll() {
+    fetch("data.json", { cache: "no-store" }).then(function (r) {
+      if (!r.ok) throw new Error(r.status);
+      return r.json();
+    }).then(function (data) {
+      pollFails = 0;
+      var prev = state && state.bankroll && state.bankroll.window_end_iso;
+      var next = data && data.bankroll && data.bankroll.window_end_iso;
+      if (next && next !== prev) render(data, false);
+      schedulePoll(60000);
+    }).catch(function () {
+      pollFails++;
+      if (pollFails >= 3) return;            // static mirror / offline — stop quietly
+      schedulePoll(120000);
+    });
+  }
 
-    function compare(a, b, key, dir) {
-      const av = a[key], bv = b[key];
-      if (typeof av === "string") {
-        return dir === "asc" ? av.localeCompare(bv) : bv.localeCompare(av);
-      }
-      return dir === "asc" ? av - bv : bv - av;
-    }
-    function render() {
-      const tbody = document.querySelector("[data-book-body]");
-      tbody.replaceChildren();
-      const sorted = data.open_book.slice().sort((a, b) => compare(a, b, sortState.key, sortState.dir));
-      sorted.forEach((r) => {
-        const paired = counts[r.market] > 1;
-        const tone = r.unrealised < 0 ? "loss" : r.unrealised > 0 ? "gain" : "flat";
-        const resolves = fmtResolves(r.hrs_left);
-        const tr = document.createElement("tr");
-        tr.innerHTML =
-          "<td><div class=\"book-market\">" +
-          '<span class="book-market-name" title="' + escAttr(r.market) + '">' + esc(r.market) + "</span>" +
-          '<span class="book-market-meta">' + esc(r.outcome.toUpperCase()) +
-          (paired ? '<span class="book-pair-flag">paired</span>' : "") +
-          "</span></div></td>" +
-          '<td><span class="book-side ' + esc(r.side.toLowerCase()) + '">' + esc(r.side) + "</span></td>" +
-          '<td class="num">' + esc(r.entry.toFixed(3)) + "</td>" +
-          '<td class="num">' + esc(r.mark.toFixed(3)) + "</td>" +
-          '<td class="num">' + esc(fmtMoney2(r.cost)) + "</td>" +
-          '<td class="num book-pl ' + tone + '">' + esc(fmtSigned(r.unrealised)) + "</td>" +
-          '<td class="num"><div class="book-resolves"><span>' + esc(resolves.rel) + "</span></div></td>";
-        tbody.appendChild(tr);
+  /* ---------- boot ------------------------------------------------------- */
+  function readEmbedded() {
+    var node = document.getElementById("bootstrap-data");
+    if (!node) return null;
+    var txt = (node.textContent || "").trim();
+    if (!txt) return null;
+    try { var d = JSON.parse(txt); return (d && d.bankroll) ? d : null; } catch (e) { return null; }
+  }
+  function boot() {
+    var embedded = readEmbedded();
+    if (embedded) { render(embedded, true); startPolling(); return; }
+    fetch("data.json", { cache: "no-store" }).then(function (r) { return r.json(); })
+      .then(function (d) { render(d, true); startPolling(); })
+      .catch(function () {
+        clear(app);
+        app.appendChild(h("div", { class: "boot" }, h("p", { class: "boot-noscript", text: "No data available (no embedded payload and data.json could not be fetched)." })));
       });
-    }
-    document.querySelectorAll("[data-book-table] th[data-sort]").forEach((th) => {
-      th.addEventListener("click", () => {
-        const key = th.dataset.sort;
-        if (sortState.key === key) {
-          sortState.dir = sortState.dir === "asc" ? "desc" : "asc";
-        } else {
-          sortState.key = key;
-          sortState.dir = ["entry", "mark", "cost", "unrealised", "hrs_left"].includes(key) ? "desc" : "asc";
-        }
-        document.querySelectorAll("[data-book-table] th").forEach((x) => x.classList.remove("is-active"));
-        th.classList.add("is-active");
-        render();
-      });
-    });
-    const netUnreal = data.open_book.reduce((a, b) => a + b.unrealised, 0);
-    const netEl = document.querySelector("[data-book-net]");
-    netEl.replaceChildren();
-    netEl.appendChild(document.createTextNode("Net unrealised · "));
-    const span = document.createElement("span");
-    span.style.color = "var(--" + (netUnreal < 0 ? "oxblood" : "jade") + ")";
-    span.textContent = fmtSigned(netUnreal);
-    netEl.appendChild(span);
-    render();
   }
 
-  /* ─────────────────────  IV — LIVE TAPE  ───────────────────── */
-  function renderTape() {
-    const decisions = data.decisions || [];
-    const buckets = new Map();
-    decisions.forEach((d) => {
-      const gate = d.detail.split("::", 1)[0].trim();
-      const key = d.strategy + "·" + gate;
-      if (!buckets.has(key)) buckets.set(key, { strategy: d.strategy, gate, count: 0, times: [] });
-      const b = buckets.get(key);
-      b.count += 1;
-      b.times.push(d.time);
-    });
-    const aggs = [...buckets.values()].sort((a, b) => b.count - a.count);
-    const max = Math.max(...aggs.map((a) => a.count), 1);
-
-    const totalRefusals = data.refusals.reduce((a, b) => a + b.count, 0);
-    document.querySelector("[data-tape-total]").textContent =
-      "  ·  " + totalRefusals.toLocaleString() + " refusals across " +
-      data.refusals.length + " gates";
-
-    const cont = document.querySelector("[data-tape-aggregates]");
-    cont.replaceChildren();
-    aggs.slice(0, 10).forEach((a) => {
-      const rangeStr = a.times.length ? a.times[0] + " – " + a.times[a.times.length - 1] : "";
-      const row = document.createElement("div");
-      row.className = "tape-row";
-      row.innerHTML =
-        '<span class="tape-row-strategy">' + esc(a.strategy) + "</span>" +
-        '<span class="tape-row-gate">' + esc(a.gate.replace(/_/g, " ")) + "</span>" +
-        '<div class="tape-row-bar"><div class="tape-row-bar-fill" style="width:' +
-        ((a.count / max) * 100).toFixed(1) + '%"></div></div>' +
-        '<span class="tape-row-count">' + esc(a.count) + "×</span>" +
-        '<span class="tape-row-window">' + esc(rangeStr) + "</span>";
-      cont.appendChild(row);
-    });
-
-    const reasons = data.refusals.slice().sort((a, b) => b.count - a.count);
-    const ol = document.querySelector("[data-tape-reasons]");
-    ol.replaceChildren();
-    reasons.forEach((r) => {
-      const li = document.createElement("li");
-      li.innerHTML =
-        '<span class="tape-reasons-name">' + esc(r.reason_code) + "</span>" +
-        '<span class="tape-reasons-count">' + esc(r.count.toLocaleString()) + "</span>";
-      ol.appendChild(li);
-    });
-  }
-
-  /* ─────────────────────  V — WATCHLIST  ───────────────────── */
-  function renderWatchlist() {
-    const tbody = document.querySelector("[data-watch-body]");
-    const watch = data.watchlist || [];
-    const deck = document.querySelector("[data-watch-deck]");
-    deck.replaceChildren();
-    deck.appendChild(document.createTextNode("Live mid-prices & gates that have passed for each watchlist market — "));
-    const em = document.createElement("em");
-    em.textContent = watch.length + " markets monitored";
-    deck.appendChild(em);
-    deck.appendChild(document.createTextNode("."));
-
-    function paint(filter = "") {
-      tbody.replaceChildren();
-      const lower = filter.toLowerCase().trim();
-      const filtered = watch.filter((r) => {
-        if (!lower) return true;
-        return (
-          r.market.toLowerCase().includes(lower) ||
-          r.gates.some((g) => g.toLowerCase().includes(lower))
-        );
-      });
-      if (filtered.length === 0) {
-        const tr = document.createElement("tr");
-        const td = document.createElement("td");
-        td.colSpan = 4;
-        td.className = "watch-empty";
-        td.textContent = "no markets match “" + filter + "”";
-        tr.appendChild(td);
-        tbody.appendChild(tr);
-        return;
-      }
-      filtered.forEach((r) => {
-        const yes = parseFloat(r.yes_mid);
-        const yesPct = isNaN(yes) ? 0 : yes * 100;
-        const display = r.market.length > 78 ? r.market.slice(0, 78) + "…" : r.market;
-        const tr = document.createElement("tr");
-        tr.innerHTML =
-          '<td><span title="' + escAttr(r.market) + '">' + esc(display) + "</span></td>" +
-          '<td class="num"><span class="watch-yes">' +
-          (isNaN(yes) ? "—" : esc(yes.toFixed(3))) +
-          '<span class="watch-yes-bar"><span style="width:' + yesPct + '%"></span></span>' +
-          "</span></td>" +
-          '<td class="num watch-spread">' + esc(r.spread) + "</td>" +
-          '<td><div class="watch-gates">' +
-          r.gates.map((g) => '<span class="gate-chip">' + esc(g) + "</span>").join("") +
-          "</div></td>";
-        tbody.appendChild(tr);
-      });
-    }
-    document.querySelector("[data-watch-filter]").addEventListener("input", (e) => {
-      paint(e.target.value);
-    });
-    paint();
-  }
-
-  /* ─────────────────────  VI — SYSTEM HEALTH  ───────────────────── */
-  function renderLLM() {
-    const tbody = document.querySelector("[data-llm-body]");
-    tbody.replaceChildren();
-    const rows = data.llm_activity.slice().sort((a, b) => b.calls - a.calls);
-    const totalCalls = rows.reduce((a, b) => a + b.calls, 0);
-    const totalIntents = rows.reduce((a, b) => a + b.intents, 0);
-    document.querySelector("[data-llm-total]").textContent =
-      totalCalls.toLocaleString() + " calls · " + totalIntents + " intents";
-
-    rows.forEach((r) => {
-      const strat = data.strategies.find((s) => s.name === r.strategy);
-      let costPerIntent = "—";
-      if (strat && strat.usd_per_call != null && r.intents > 0) {
-        costPerIntent = fmtSigned((strat.usd_per_call * r.calls) / r.intents, 4);
-      }
-      const tr = document.createElement("tr");
-      tr.innerHTML =
-        "<td>" + esc(r.strategy) + "</td>" +
-        '<td class="num">' + esc(r.calls.toLocaleString()) + "</td>" +
-        '<td class="num">' + esc(r.intents.toLocaleString()) + "</td>" +
-        '<td class="num dim">' + esc(r.conv) + "</td>" +
-        '<td class="num dim">' + esc(costPerIntent) + "</td>";
-      tbody.appendChild(tr);
-    });
-  }
-
-  function renderSettlements() {
-    const week = data.settlements_7d || [];
-    const totalPaid = week.reduce((a, b) => a + (b.paid_usd || 0), 0);
-    const totalWins = week.reduce((a, b) => a + (b.wins || 0), 0);
-    const totalLoss = week.reduce((a, b) => a + (b.losses || 0), 0);
-    document.querySelector("[data-settle-meta]").textContent =
-      totalWins + " W · " + totalLoss + " L · " + fmtMoney0(totalPaid) + " paid";
-
-    const svg = d3.select("[data-settle-chart]");
-    svg.selectAll("*").remove();
-    const W = svg.node().parentElement.getBoundingClientRect().width || 360;
-    const H = 140;
-    const M = { top: 12, right: 6, bottom: 22, left: 6 };
-    svg.attr("viewBox", `0 0 ${W} ${H}`);
-    const x = d3.scaleBand().domain(week.map((d) => d.date)).range([M.left, W - M.right]).padding(0.2);
-    const yMax = Math.max(...week.map((d) => Math.max(d.wins, d.losses)), 1);
-    const y = d3.scaleLinear().domain([-yMax, yMax]).range([H - M.bottom, M.top]);
-    svg.append("g").attr("class", "axis")
-      .attr("transform", `translate(0,${y(0)})`)
-      .call(d3.axisBottom(x).tickFormat((d) => d.slice(5)).tickSize(0))
-      .call((g) => g.select(".domain").remove())
-      .call((g) => g.selectAll("text").attr("transform", `translate(0,8)`));
-    svg.selectAll(".bar-loss").data(week).enter().append("rect")
-      .attr("class", "bar-loss")
-      .attr("x", (d) => x(d.date)).attr("y", y(0))
-      .attr("width", x.bandwidth())
-      .attr("height", (d) => y(0) - y(-d.losses));
-    svg.selectAll(".bar-gain").data(week).enter().append("rect")
-      .attr("class", "bar-gain")
-      .attr("x", (d) => x(d.date)).attr("y", (d) => y(d.wins))
-      .attr("width", x.bandwidth())
-      .attr("height", (d) => y(0) - y(d.wins));
-
-    const ul = document.querySelector("[data-settle-list]");
-    ul.replaceChildren();
-    data.settlements.slice(0, 6).forEach((s) => {
-      const tone = s.total > 0 ? "gain" : s.total < 0 ? "loss" : "flat";
-      const li = document.createElement("li");
-      li.innerHTML =
-        '<span class="settle-mid">market</span>' +
-        "<span>" + esc(s.market_id) + "</span>" +
-        "<span>" + esc(s.outcome) + " · $/share " + esc(s.usd_per_share.toFixed(4)) + "</span>" +
-        '<span class="settle-total ' + tone + '">' + esc(fmtSigned(s.total)) + "</span>";
-      ul.appendChild(li);
-    });
-  }
-
-  /* ─────────────────────  FOLIO NAV scroll-spy  ───────────────────── */
-  function bindFolioNav() {
-    const sections = [
-      "folio-equity",
-      "folio-strategies",
-      "folio-book",
-      "folio-tape",
-      "folio-watch",
-      "folio-health",
-    ];
-    const links = new Map(
-      sections.map((id) => [id, document.querySelector('[data-folio-link="' + id + '"]')])
-    );
-    const obs = new IntersectionObserver(
-      (entries) => {
-        entries.forEach((e) => {
-          if (e.isIntersecting) {
-            links.forEach((l) => l && l.classList.remove("is-active"));
-            const a = links.get(e.target.id);
-            if (a) a.classList.add("is-active");
-          }
-        });
-      },
-      { rootMargin: "-40% 0px -55% 0px", threshold: 0 }
-    );
-    sections.forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) obs.observe(el);
-    });
-  }
-
-  /* ─────────────────────  bootstrap  ───────────────────── */
-  renderHero();
-  renderEquity();
-  bindRangeControls();
-  renderStrategies();
-  renderBook();
-  renderTape();
-  renderWatchlist();
-  renderLLM();
-  renderSettlements();
-  bindFolioNav();
-  bindThemeToggle();
-
-  let resizeT;
-  window.addEventListener("resize", () => {
-    clearTimeout(resizeT);
-    resizeT = setTimeout(() => {
-      const active = document.querySelector("[data-range].is-active");
-      renderEquity(active ? active.dataset.range : "since_reset");
-      renderSettlements();
-    }, 120);
-  });
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
+  else boot();
 })();
