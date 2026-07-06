@@ -6,4 +6,4 @@ Hourly static snapshot of the live polymarket-agent dashboard, mirrored from the
 
 Live (real-time SSE) version runs on the gateway and is private.
 
-Last refreshed: 2026-07-06T19:06:03Z
+Last refreshed: 2026-07-06T20:05:49Z
