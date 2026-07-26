@@ -873,7 +873,18 @@
     box.appendChild(table);
   }
   function ledgerRow(s2, worstSet) {
-    var nameCell = h("td", { class: "ledger-name" }, [s2.name, s2.is_llm_strategy ? h("span", { class: "tag", text: "LLM" }) : null]);
+    // M5 drawdown kill-switch badge — same numbers as the risk engine's
+    // strategy_drawdown_kill_switch refusals (shared assessment helper).
+    var ks = s2.kill_switch;
+    var ksTag = null;
+    if (ks && ks.status && ks.status !== "OK") {
+      var ksTone = (ks.status === "TRIPPED" || ks.status === "DATA_UNAVAILABLE") ? " tag-danger" : "";
+      var ksTitle = "trailing " + (ks.trailing_days || 0) + "d realised: " +
+        (ks.trailing_pnl_usd == null ? "n/a" : moneySigned(ks.trailing_pnl_usd, 2)) +
+        " | floor " + moneySigned(ks.floor_usd, 0) + " | " + (ks.action || "");
+      ksTag = h("span", { class: "tag" + ksTone, text: ks.status.toLowerCase().replace(/_/g, " "), title: ksTitle });
+    }
+    var nameCell = h("td", { class: "ledger-name" }, [s2.name, ksTag, s2.is_llm_strategy ? h("span", { class: "tag", text: "LLM" }) : null]);
     var winCell = h("td", {}, s2.win_rate == null ? "—" : h("span", { class: "win-cell" }, [
       h("span", { text: pctFrac(s2.win_rate, 0) }),
       h("span", { class: "win-track" }, h("span", { class: "win-fill", style: "width:" + (s2.win_rate * 100) + "%" }))

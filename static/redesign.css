@@ -389,6 +389,7 @@ table { border-collapse: collapse; width: 100%; }
 .ledger-row:hover td { background: color-mix(in srgb, var(--ink) 4%, transparent); }
 .ledger-name { text-align: left !important; font-family: var(--ui); font-weight: 500; }
 .ledger-name .tag { font-family: var(--mono); font-size: .58rem; letter-spacing: .08em; text-transform: uppercase; color: var(--gold); border: 1px solid color-mix(in srgb, var(--gold) 35%, transparent); border-radius: 3px; padding: 0 .25rem; margin-left: .4rem; vertical-align: middle; }
+.ledger-name .tag-danger { color: var(--loss-ink); border-color: color-mix(in srgb, var(--loss) 38%, transparent); }
 .win-cell { display: inline-flex; align-items: center; gap: .4rem; justify-content: flex-end; }
 .win-track { width: 34px; height: 4px; border-radius: 2px; background: var(--panel-2); overflow: hidden; }
 .win-fill { height: 100%; background: var(--profit); }
